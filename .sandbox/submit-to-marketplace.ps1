@@ -153,6 +153,62 @@ foreach ($shot in $shots) {
   }
 }
 
+# ------------------------------------------------------------------------- *
+# 4b. the registry's OWN validators, against a fresh clone of its main
+#
+# Everything above reads our file and our repo. This reads the registry as it
+# stands TODAY: it clones upstream main, drops the entry in, commits it, and
+# runs the same things pr-check.yml runs. That matters because the entry was
+# written against an earlier main -- the registry has since grown past 4200
+# entries and its commit-count floor was dropped on 2026-09-03, so "it passed
+# when it was written" is not evidence it passes now.
+#
+# Two of these checks fail on a bare Windows clone for environmental reasons,
+# and both are handled honestly rather than skipped:
+#   - build-site.mjs enforces a star-coverage floor that upstream main itself
+#     does not satisfy (data/stars.json covers ~35% of entries). CI sets
+#     SKIP_PUBLISH_CHECKS=1; the pre-flight does the same.
+#   - awesome-lint derives a repo URL and gets a Windows path, because the
+#     registry's package.json declares no `repository`. It fails identically on
+#     a clean main with no entry added, so the pre-flight lints clean main as a
+#     baseline and only reports a REGRESSION as a failure.
+# ------------------------------------------------------------------------- *
+if ($CheckOnly) {
+  Step 'the registry validators (fresh clone of upstream main)'
+  $clone = Join-Path $env:TEMP 'awesome-preflight'
+  if (Test-Path $clone) { Remove-Item $clone -Recurse -Force }
+  # git reports "Cloning into ..." on stderr; PowerShell surfaces that as a
+  # NativeCommandError even on success. Verify the result, not the exit code.
+  $ErrorActionPreference = 'Continue'
+  & gh repo clone awesome-dsh-plugin/awesome-dsh-plugin $clone -- --depth 1 --branch main 2>&1 | Out-Null
+  $ErrorActionPreference = 'Stop'
+  if (-not (Test-Path (Join-Path $clone 'data\plugins'))) { throw "could not clone the registry into $clone" }
+  $entryCount = @(Get-ChildItem (Join-Path $clone 'data\plugins') -Filter '*.yml').Count
+  Write-Host "  ok   upstream main cloned ($entryCount entries)"
+
+  # git identity, or the entry cannot be committed and the added-date
+  # derivation has no commit to read.
+  & git -C $clone config user.email 'archaofan@users.noreply.github.com'
+  & git -C $clone config user.name 'Archaofan'
+
+  # The linter is fetched by npx in CI; install it so the check can run at all.
+  # npm writes progress to stderr, which PowerShell surfaces as a
+  # NativeCommandError even on success -- so ignore the exit code and verify the
+  # artifact exists instead.
+  Push-Location $clone
+  $ErrorActionPreference = 'Continue'
+  & npm install --no-save --silent awesome-lint 2>&1 | Out-Null
+  $ErrorActionPreference = 'Stop'
+  Pop-Location
+  if (-not (Test-Path (Join-Path $clone 'node_modules\awesome-lint\cli.js'))) {
+    throw 'could not install awesome-lint into the registry clone'
+  }
+  Write-Host "  ok   awesome-lint available for the check"
+
+  & node "$PSScriptRoot\pr-preflight.cjs" $clone $Entry
+  if ($LASTEXITCODE -ne 0) { throw "the registry validators did not all pass (exit $LASTEXITCODE)" }
+}
+
 if ($CheckOnly) {
   Write-Host "`nCHECK COMPLETE -- everything clears except anything flagged above." -ForegroundColor Green
   exit 0
