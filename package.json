@@ -56,6 +56,15 @@
   "engines": {
     "dsh": ">=0.1.6-alpha.1"
   },
+  "scripts": {
+    "check": "node --check index.js && node --check client.js",
+    "gate": "node .sandbox/gate.cjs",
+    "host": "node .sandbox/host-harness.cjs index.js",
+    "client": "node .sandbox/client-harness.cjs client.js",
+    "e2e": "node .sandbox/e2e-notify.mjs",
+    "receiver": "node .sandbox/receiver.cjs",
+    "live": "node .sandbox/live-check.cjs"
+  },
   "devDependencies": {
     "playwright": "^1.49.0"
   }
