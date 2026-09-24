@@ -175,8 +175,24 @@ foreach ($shot in $shots) {
 # ------------------------------------------------------------------------- *
 if ($CheckOnly) {
   Step 'the registry validators (fresh clone of upstream main)'
-  $clone = Join-Path $env:TEMP 'awesome-preflight'
-  if (Test-Path $clone) { Remove-Item $clone -Recurse -Force }
+  # A UNIQUE directory per run, not a fixed one. A fixed name means every run
+  # after the first has to delete the previous clone, and that clone is a
+  # 4287-entry registry with node_modules nested past MAX_PATH -- plain
+  # Remove-Item and even [Directory]::Delete both fail with "cannot find the
+  # file specified" on those long paths. A unique name sidesteps it; the
+  # robocopy purge below is only for cleaning up what earlier runs left.
+  $clone = Join-Path $env:TEMP "awesome-preflight-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+
+  # robocopy /purge is the only deletion that survives MAX_PATH-length paths.
+  # Mirror an empty directory onto the target, then remove the husk.
+  foreach ($stale in @(Get-ChildItem $env:TEMP -Directory -Filter 'awesome-preflight-*' -ErrorAction SilentlyContinue)) {
+    $empty = Join-Path $env:TEMP ("empty-$([guid]::NewGuid().ToString('N').Substring(0,8)))")
+    New-Item -ItemType Directory -Path $empty -Force | Out-Null
+    & robocopy $empty $stale.FullName /purge /njh /njs /ndl /nc /ns /nfl 2>&1 | Out-Null
+    if (Test-Path $stale.FullName) { Remove-Item $stale.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    Remove-Item $empty -Force -ErrorAction SilentlyContinue
+  }
+
   # git reports "Cloning into ..." on stderr; PowerShell surfaces that as a
   # NativeCommandError even on success. Verify the result, not the exit code.
   $ErrorActionPreference = 'Continue'
