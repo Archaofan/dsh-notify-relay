@@ -253,6 +253,14 @@ if ($CheckOnly) {
 
   & node "$PSScriptRoot\pr-preflight.cjs" $clone $Entry
   if ($LASTEXITCODE -ne 0) { throw "the registry validators did not all pass (exit $LASTEXITCODE)" }
+
+  # The pre-flight passing is only half the story: a check that cannot fail
+  # reports green while proving nothing. So each diff-based step is driven into
+  # a state CI would reject and asserted to reject it -- for the RIGHT reason,
+  # which the first draft of this test got wrong (it passed on "expected 1 added
+  # yml, got 0" because a reset had quietly removed the entry it meant to move).
+  & node "$PSScriptRoot\negative-test-preflight-steps.cjs" $clone $Entry
+  if ($LASTEXITCODE -ne 0) { throw "the pre-flight steps cannot all fail when they should (exit $LASTEXITCODE)" }
 }
 
 if ($CheckOnly) {
