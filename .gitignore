@@ -2,9 +2,21 @@
 # harnesses can resolve @deepseek-ai/dsh-home-paths. Never commit it.
 node_modules/
 
+# A DSH_HOME holds live credentials (.credentials.yaml, .anonymous-user-id) and
+# session state. Ignore the shapes one could take, so a stray `git add -A` can
+# never stage them even if a sandbox is created here later.
+home/
+.sandbox/home/
+.sandbox-next/
+
 # Pack output
 *.tgz
 .sandbox/pack/
+
+# Logs — every gate run redirects into one, and 67 of them had piled up
+# untracked, which is exactly what an accidental `git add -A` would commit.
+*.log
+*.log.*
 
 # Runtime artifacts the gates produce
 .sandbox/received.json
@@ -21,5 +33,7 @@ node_modules/
 .sandbox/_head.tmp
 .sandbox/_tail.tmp
 .sandbox/release-notes.md
+.sandbox/diag-built.cjs
+.sandbox/probe-overlay.mjs
 
 .sandbox/commit-msg.txt
