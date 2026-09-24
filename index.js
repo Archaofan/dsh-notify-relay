@@ -9,11 +9,17 @@
  *
  *   event → classify → dedup → quiet hours → digest → route → channel
  *
- * Deliberately narrow for 0.1.0:
- *   - four event kinds, each individually switchable,
+ * Deliberately narrow in scope, and it has stayed that way:
+ *   - eight event kinds, each individually switchable,
  *   - seven webhook-class channels (no SMTP, no stored browser cookies),
  *   - one rule set (fingerprint dedup, quiet hours, digest batching),
- *   - four slash commands and five same-origin routes for the browser half.
+ *   - one slash command with six verbs, and five same-origin routes for the
+ *     browser half.
+ *
+ * The counts above were written for 0.1.0 as "four event kinds, four slash
+ * commands" and were never updated as the surface grew. They are load-bearing
+ * documentation -- `status` prints `EVENT_KINDS.length` and the marketplace
+ * entry states the same numbers -- so a stale count here contradicts both.
  *
  * The browser half owns all presentation (official settings section, sidebar
  * status). Everything here is policy and transport.
