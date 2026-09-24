@@ -120,6 +120,57 @@ const TURN_END_KINDS = {
   error: 'task.failed',
 }
 
+/**
+ * Severity, and the channel-native field each one maps to.
+ *
+ * A flat "it happened" is not enough. An approval request and a task-done are
+ * both events, but one costs the user money if it is missed and the other is
+ * trivia. Every mature notification system separates severity from content
+ * (Grafana alerting, Alertmanager, PagerDuty severity to urgency); a notifier
+ * that cannot express it forces the user to either miss the important one or be
+ * spammed by the unimportant one.
+ *
+ * The mapping is not decorative - these are real API fields, verified against
+ * the vendor docs:
+ *
+ * - Bark `level` is `'critical' | 'active' | 'timeSensitive' | 'passive'`
+ *   ([API V2](https://raw.githubusercontent.com/Finb/bark-server/master/docs/API_V2.md)).
+ *   `critical` plus `call: '1'` is the only primitive in this plugin's whole
+ *   channel set that breaks through iOS silent mode and Do Not Disturb, which is
+ *   exactly what an approval request needs and exactly what a task-done must not
+ *   have.
+ * - ntfy `Priority` is 1-5 (`max`/`urgent`/`high`/`default`/`low`/`min`)
+ *   ([publishing](https://docs.ntfy.sh/publish/)).
+ * - Telegram `disable_notification` is the inverse: it downgrades to a silent
+ *   message rather than upgrading.
+ *
+ * A channel with no severity primitive keeps its existing shape and is not lied
+ * to - inventing a field the API ignores is worse than omitting one.
+ */
+export const SEVERITIES = ['critical', 'high', 'normal', 'low']
+
+/** Severity per event kind. Missing kinds default to `normal`. */
+export const SEVERITY_BY_KIND = {
+  'approval.asked': 'critical',
+  'task.failed': 'high',
+  'task.aborted': 'high',
+  'task.blocked': 'high',
+  'request.failed': 'high',
+  'tool.failed': 'high',
+  'task.done': 'normal',
+  'approval.decided': 'normal',
+  digest: 'normal',
+  test: 'normal',
+  /* The plugin reporting on itself. High, not critical: it must not be able to
+     pre-empt the approval it is warning about. */
+  'relay.degraded': 'high',
+}
+
+/** Severity for a notification kind. Total: unknown kinds are `normal`. */
+export function severityOf(kind) {
+  return SEVERITY_BY_KIND[kind] || 'normal'
+}
+
 /** Channel kinds 0.1.0 can deliver to. Every one is an HTTP call to a URL. */
 export const CHANNEL_KINDS = [
   { id: 'bark', secretFields: ['key'] },
@@ -147,6 +198,24 @@ const DELIVERY_CONCURRENCY = 3
 /** How much of a message body takes part in the dedup fingerprint. */
 const FINGERPRINT_BODY_CHARS = 120
 
+/**
+ * Consecutive failures on one channel before its breaker opens. Three, not one:
+ * a single failure is a blip, and a breaker that opens on a blip converts a
+ * transient network error into a missing notification - the exact failure mode
+ * this plugin exists to prevent.
+ */
+export const MAX_CHANNEL_FAILURES = 3
+/**
+ * How long a channel stays open after tripping, and how that grows. Doubling
+ * from one minute to a thirty-minute ceiling, so a channel that is down for an
+ * hour is probed twice rather than sixty times.
+ */
+export const CHANNEL_COOLDOWN_STEPS_MS = [60_000, 300_000, 900_000, 1_800_000]
+/** An outbox entry older than this means the retry path itself is stuck. */
+export const STUCK_OUTBOX_MS = 30 * 60_000
+/** How often the plugin may warn the user that it is degraded. Once an hour. */
+export const DEGRADED_COOLDOWN_MS = 60 * 60_000
+
 /* ------------------------------------------------------------------ *
  * Config shape, defaults and validation
  * ------------------------------------------------------------------ */
@@ -164,6 +233,13 @@ export function defaultConfig() {
        audience is Chinese-speaking, and a misread notification is worse than
        none. */
     language: 'zh',
+    /* Tap target for channels that support one (Bark `url`, ntfy `Click`).
+       Optional and empty by default, because the honest answer to "where should
+       this open?" is deployment-specific: DSH's web server usually listens on
+       127.0.0.1, which is a useless link on a phone. `{session}` is replaced by
+       the session id when there is one. Guessing a URL scheme would produce a
+       link that opens the wrong page, which is worse than no link. */
+    deepLink: '',
     events,
     dedup: { windowMinutes: 10 },
     quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
@@ -311,6 +387,13 @@ export function validateConfig(raw) {
     value: {
       enabled: boolOr(raw.enabled, base.enabled),
       language: raw.language === 'en' || raw.language === 'zh' ? raw.language : base.language,
+      /* Only an http(s) URL carrying a `{session}` placeholder survives. Without
+         the placeholder the link cannot say WHICH session the notification is
+         about, so it opens something unrelated; and a `javascript:` "deep link"
+         would be a push notification that executes code on tap. */
+      deepLink: /^https?:\/\/\S*\{session\}\S*$/.test(String(raw.deepLink ?? '').trim())
+        ? String(raw.deepLink).trim().slice(0, 2048)
+        : '',
       events,
       dedup,
       quiet,
@@ -358,6 +441,13 @@ const HOST_STRINGS = {
     statusChannels: (n) => `通道 ${n} 个`,
     statusOutbox: (n) => `待重试 ${n} 条`,
     statusHeld: (n) => `合批待发 ${n} 条`,
+    statusBreakers: (ids) => `熔断中：${ids}`,
+    statusOldest: (age) => `最早就绪于 ${age} 前`,
+    statusLastOk: (age) => `上次成功投递 ${age} 前`,
+    degradedTitle: 'notify-relay 自检告警',
+    degradedBreaker: (ids) => `通道连续失败，已暂停重试：${ids}`,
+    degradedStuck: (n, age) => `${n} 条通知在重试队列中等待了 ${age}`,
+    degradedNever: '自启动以来从未成功投递，请检查通道配置',
     mutedFor: (m) => `已静音 ${m} 分钟`,
     muteCleared: '静音已清除',
     flushed: (n) => `已发送合批的 ${n} 条`,
@@ -378,6 +468,13 @@ const HOST_STRINGS = {
     statusChannels: (n) => `${n} channel${n === 1 ? '' : 's'}`,
     statusOutbox: (n) => `${n} awaiting retry`,
     statusHeld: (n) => `${n} held for digest`,
+    statusBreakers: (ids) => `circuit open: ${ids}`,
+    statusOldest: (age) => `oldest pending item waited ${age}`,
+    statusLastOk: (age) => `last successful delivery ${age} ago`,
+    degradedTitle: 'notify-relay self-check warning',
+    degradedBreaker: (ids) => `channels failing repeatedly, retries paused: ${ids}`,
+    degradedStuck: (n, age) => `${n} notification${n === 1 ? '' : 's'} stuck in the retry queue for ${age}`,
+    degradedNever: 'nothing has been delivered since start-up; check the channel configuration',
     mutedFor: (m) => `muted for ${m} minute${m === 1 ? '' : 's'}`,
     muteCleared: 'mute cleared',
     flushed: (n) => `flushed ${n} held notification${n === 1 ? '' : 's'}`,
@@ -451,14 +548,45 @@ export function isWithinQuietHours(now, quiet) {
  * Channel payloads (pure — one builder per channel kind)
  * ------------------------------------------------------------------ */
 
-/** Bark. */
+/**
+ * The tap target for a notification, or `undefined` when none is configured.
+ *
+ * A deep link is the difference between a push that says "DSH needs you" and one
+ * that says "DSH needs you, here is the exact session". Bark and ntfy both
+ * support it natively; the other channels have no equivalent field, so they get
+ * nothing rather than a URL pasted into the body where it is not clickable.
+ */
+function linkFor(notification) {
+  const template = typeof config === 'undefined' ? '' : config.deepLink
+  if (!template) return undefined
+  const session = notification.sessionId && notification.sessionId !== '*' ? notification.sessionId : ''
+  /* Without a session to substitute the link is a lie — it opens something
+     unrelated to the notification it arrived with. */
+  if (!session) return undefined
+  return template.replace(/\{session\}/g, session).slice(0, 2048)
+}
+
+/** Bark. `level` is the only field in the whole channel set that pierces DND. */
 function barkPayload(n, secrets) {
+  const level = { critical: 'critical', high: 'timeSensitive', normal: 'active', low: 'passive' }[n.severity] || 'active'
+  const link = linkFor(n)
   return {
     url: `https://api.day.app/${encodeURIComponent(secrets.key || '')}`,
     init: {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ title: n.title, body: n.body, group: PLUGIN_ID }),
+      body: JSON.stringify({
+        title: n.title,
+        body: n.body,
+        group: PLUGIN_ID,
+        level,
+        /* `call` makes the ringtone play for 30 seconds and, with
+           `level: 'critical'`, ignores the mute switch and Do Not Disturb.
+           Reserved for approval requests: using it for anything else is how a
+           notifier gets uninstalled. */
+        ...(n.severity === 'critical' ? { call: '1', volume: '10' } : {}),
+        ...(link ? { url: link } : {}),
+      }),
     },
   }
 }
@@ -486,6 +614,10 @@ function telegramPayload(n, secrets) {
         chat_id: secrets.chatId || '',
         text: `${n.title}\n\n${n.body}`,
         disable_web_page_preview: true,
+        /* Telegram has no upgrade path — only a downgrade. `disable_notification`
+           sends the message without a sound or a pop-over, which is the right
+           shape for a task-done and the wrong one for an approval. */
+        disable_notification: n.severity === 'low',
       }),
     },
   }
@@ -517,11 +649,18 @@ function feishuPayload(n, secrets) {
 
 /** ntfy: plain text to a topic; the topic lives in the channel URL. */
 function ntfyPayload(n) {
+  const link = linkFor(n)
   return {
     url: '',
     init: {
       method: 'POST',
-      headers: { 'content-type': 'text/plain' },
+      headers: {
+        'content-type': 'text/plain',
+        /* ntfy's priority scale is 1-5; `normal` sits on the default so a
+           default-configured topic keeps behaving the way it always did. */
+        priority: { critical: '5', high: '4', normal: '3', low: '2' }[n.severity] || '3',
+        ...(link ? { click: link } : {}),
+      },
       body: `${n.title}\n${n.body}`,
     },
   }
@@ -540,6 +679,7 @@ function webhookPayload(n, secrets) {
       body: JSON.stringify({
         source: PLUGIN_ID,
         kind: n.kind,
+        severity: n.severity,
         title: n.title,
         body: n.body,
         sessionId: n.sessionId,
@@ -602,6 +742,27 @@ let log = []
  * @type {Array<{ notification: object, attempts: number, nextAttemptAt: number, lastError: string }>}
  */
 let outbox = []
+/**
+ * Per-channel circuit breaker state, keyed by channel id.
+ *
+ * Without this, a channel that is hard down — revoked token, decommissioned
+ * host, DNS that stopped resolving — is retried on every single notification,
+ * six times each, forever. Each retry costs a full timeout, so the outbox grows,
+ * the backoff ceiling stretches to thirty minutes, and the user's *working*
+ * channels are delayed behind the dead one. The fix is to stop asking the dead
+ * channel and say so, rather than to keep asking politely.
+ *
+ * Not persisted: a breaker is a statement about the network *now*, and a
+ * restart is exactly when the network may have been fixed. Re-tripping after a
+ * restart costs three attempts, which is cheap; trusting a stale "unhealthy"
+ * flag across a restart could suppress a channel for thirty minutes for no
+ * reason.
+ *
+ * @type {Map<string, { failures: number, openUntil: number, cooldown: number }>}
+ */
+const breakers = new Map()
+/** When the plugin last warned the user that it was degraded. */
+let degradedNotifiedAt = 0
 /** Serializes read-modify-write cycles so concurrent mutations cannot interleave. */
 let queue = Promise.resolve()
 
@@ -772,9 +933,49 @@ function channelsFor(notification) {
 }
 
 /**
+ * Whether a channel's breaker is currently open.
+ *
+ * A channel whose cooldown has elapsed gets exactly one probe — the half-open
+ * state — and the caller's result decides whether the breaker resets or
+ * re-arms. Exported for the harness, which needs to drive the state machine
+ * without waiting on real clocks.
+ *
+ * @param {string} channelId
+ * @param {number} [now]
+ */
+export function breakerOpen(channelId, now = Date.now()) {
+  const state = breakers.get(channelId)
+  if (!state) return false
+  return state.openUntil > now
+}
+
+/** Records a delivery outcome on the channel's breaker. */
+function noteOutcome(channelId, ok) {
+  const state = breakers.get(channelId) || { failures: 0, openUntil: 0, cooldown: 0 }
+  if (ok) {
+    /* A success clears everything, including the cooldown ladder, so a channel
+       that recovers does not carry a longer penalty than it earned. */
+    if (state.failures > 0 || state.openUntil > 0) breakers.set(channelId, { failures: 0, openUntil: 0, cooldown: 0 })
+    return
+  }
+  state.failures += 1
+  if (state.failures >= MAX_CHANNEL_FAILURES) {
+    const step = CHANNEL_COOLDOWN_STEPS_MS[Math.min(state.cooldown, CHANNEL_COOLDOWN_STEPS_MS.length - 1)]
+    state.openUntil = Date.now() + step
+    state.cooldown = Math.min(state.cooldown + 1, CHANNEL_COOLDOWN_STEPS_MS.length)
+  }
+  breakers.set(channelId, state)
+}
+
+/**
  * Delivers to one channel and records the outcome. Never throws — a failed
  * delivery must not propagate back into the event that triggered it, because
  * that would turn a notification problem into an agent-loop problem.
+ *
+ * A channel whose breaker is open is skipped without a network call and is NOT
+ * queued for retry: retrying it per-notification is the behaviour the breaker
+ * exists to stop. The skip is still logged, because a silent skip is the exact
+ * failure this plugin was written to eliminate.
  *
  * @param {object} channel
  * @param {object} notification
@@ -783,8 +984,23 @@ function channelsFor(notification) {
  */
 async function deliverTo(channel, notification, meta) {
   const started = Date.now()
+  if (breakerOpen(channel.id)) {
+    const entry = {
+      ...meta,
+      channelId: channel.id,
+      kind: channel.kind,
+      ok: false,
+      error: 'circuit open',
+      skipped: true,
+      ms: 0,
+    }
+    await recordDelivery(entry)
+    return entry
+  }
   const built = buildDelivery(channel, notification)
   if (built.error) {
+    /* A malformed channel is a config bug, not a network blip: tripping the
+       breaker on it would hide the error behind a cooldown. */
     const entry = { ...meta, channelId: channel.id, kind: channel.kind, ok: false, error: built.error, ms: 0 }
     await recordDelivery(entry)
     return entry
@@ -800,6 +1016,7 @@ async function deliverTo(channel, notification, meta) {
       ms: Date.now() - started,
       ...(response.ok ? {} : { error: `http ${response.status}` }),
     }
+    noteOutcome(channel.id, response.ok)
     await recordDelivery(entry)
     return entry
   } catch (error) {
@@ -836,8 +1053,14 @@ async function deliverTo(channel, notification, meta) {
  *   cannot be re-queued forever).
  */
 async function deliver(notification, options = {}) {
-  const targets = channelsFor(notification)
-  const meta = { event: notification.kind, title: notification.title }
+  const targets = options.channels || channelsFor(notification)
+  const meta = {
+    event: notification.kind,
+    title: notification.title,
+    /* Recorded per row so the log can distinguish "an approval was delivered"
+       from "a task finished", which a boolean `ok` cannot. */
+    severity: notification.severity || severityOf(notification.kind),
+  }
   const results = []
   for (let i = 0; i < targets.length; i += DELIVERY_CONCURRENCY) {
     const batch = targets.slice(i, i + DELIVERY_CONCURRENCY)
@@ -867,6 +1090,10 @@ async function enqueueRetry(notification, failedResults) {
     outbox.unshift({
       notification,
       attempts: 1,
+      /* When this first entered the queue, not when it last failed. The
+         self-monitor needs the age of the *wait*, and re-stamping it on every
+         retry would make a permanently stuck notification look brand new. */
+      firstSeenAt: Date.now(),
       nextAttemptAt: Date.now() + backoffMs(1),
       lastError: failedResults.map((f) => `${f.channelId}: ${f.error ?? f.status}`).join('; ').slice(0, 300),
     })
@@ -875,9 +1102,29 @@ async function enqueueRetry(notification, failedResults) {
   await persistOutbox()
 }
 
-/** Exponential backoff: 30s, 1m, 2m, 4m … capped at 30 minutes. */
-function backoffMs(attempts) {
-  return Math.min(30_000 * 2 ** Math.max(0, attempts - 1), 30 * 60_000)
+/**
+ * Exponential backoff with jitter: 30s, 1m, 2m, 4m ... capped at 30 minutes,
+ * then multiplied by a uniform draw in [0.75, 1.25].
+ *
+ * The jitter is not decoration. Without it every pending item computes the
+ * *same* next-attempt time, so the moment a shared channel recovers - or the
+ * moment the process restarts and reloads the whole outbox at once - every
+ * queued notification fires at it simultaneously. A notifier whose own failure
+ * mode is "many things failed at once" is precisely the case that produces a
+ * thundering herd, and full jitter is the canonical fix (AWS Architecture Blog,
+ * "Exponential Backoff and Jitter").
+ *
+ * +/-25% rather than full [0, cap] jitter: full jitter can schedule a retry
+ * effectively immediately, which for a 10s-timeout channel means a hot loop.
+ * Bounded jitter keeps the exponential shape and removes the synchronisation.
+ *
+ * @param {number} attempts
+ * @param {() => number} [rand] injectable for the harness, which must be able to
+ *   assert both the base curve and the bounds deterministically.
+ */
+export function backoffMs(attempts, rand = Math.random) {
+  const base = Math.min(30_000 * 2 ** Math.max(0, attempts - 1), 30 * 60_000)
+  return Math.round(base * (0.75 + rand() * 0.5))
 }
 
 /**
@@ -933,23 +1180,150 @@ async function drainOutbox(options = {}) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Self-monitoring: the notifier reporting on itself
+ * ------------------------------------------------------------------ */
+
+/** A compact age like `4h12m`, for humans reading a status line. */
+function humanAge(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '-'
+  const minutes = Math.floor(ms / 60_000)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h${minutes % 60 ? `${minutes % 60}m` : ''}`
+  return `${Math.floor(hours / 24)}d${hours % 24 ? `${hours % 24}h` : ''}`
+}
+
+/** Channels whose breaker is currently open. */
+function openBreakerIds() {
+  const now = Date.now()
+  return config.channels.filter((channel) => breakerOpen(channel.id, now)).map((channel) => channel.id)
+}
+
+/** Breaker state keyed by channel id, for the JSON routes. */
+function breakerSummary() {
+  const now = Date.now()
+  return Object.fromEntries(
+    config.channels.map((channel) => {
+      const state = breakers.get(channel.id)
+      return [
+        channel.id,
+        {
+          open: breakerOpen(channel.id, now),
+          failures: state?.failures ?? 0,
+          retryInMs: state && state.openUntil > now ? state.openUntil - now : 0,
+        },
+      ]
+    }),
+  )
+}
+
+/**
+ * Warns the user that the relay itself is unhealthy, at most once an hour, and
+ * only through a channel that is still working.
+ *
+ * This is the single highest-leverage thing a notifier can do, and the one this
+ * plugin was missing. Healthchecks.io is built on exactly this idea - a Period
+ * plus a Grace Time, so that *silence* is itself an alert. A notifier that
+ * quietly stops notifying is strictly worse than no notifier, because the user
+ * believes they are covered. Every other feature here improves the message;
+ * this one is the only one that can tell you the messages are not arriving.
+ *
+ * It is deliberately conservative:
+ *
+ * - **Once per hour.** A warning that fires on every tick trains the user to
+ *   ignore it, and an ignored warning is worse than none.
+ * - **Only through a healthy channel.** Warning through the dead channel would
+ *   add a failure to the very thing being reported, and could recurse.
+ * - **Never queued for retry.** A degraded warning that fails must not join the
+ *   outbox it is describing, or the outbox grows because of its own alarm.
+ * - **Never through `classify()`.** `relay.degraded` is not a user-configurable
+ *   event, so the event switches must not be able to silence it.
+ *
+ * @param {{ force?: boolean }} [options]
+ */
+async function reportDegraded(options = {}) {
+  const now = Date.now()
+  if (!options.force && now - degradedNotifiedAt < DEGRADED_COOLDOWN_MS) return { reported: false }
+  if (!config.enabled || config.channels.length === 0) return { reported: false }
+
+  const s = t()
+  const openIds = openBreakerIds()
+  const stuck = outbox.filter((item) => now - (item.firstSeenAt || now) > STUCK_OUTBOX_MS)
+  const everDelivered = log.some((entry) => !entry.suppressed && entry.ok)
+
+  const lines = []
+  if (openIds.length > 0) lines.push(s.degradedBreaker(openIds.join(', ')))
+  if (stuck.length > 0) {
+    const oldest = Math.min(...stuck.map((item) => item.firstSeenAt || now))
+    lines.push(s.degradedStuck(stuck.length, humanAge(now - oldest)))
+  }
+  if (!everDelivered) lines.push(s.degradedNever)
+  if (lines.length === 0) return { reported: false }
+
+  /* Deliver through the channels that are NOT open. If every channel is open,
+     there is nobody to tell - recording it in the log is the honest outcome,
+     because at least it is visible to the one user who opens the panel. */
+  const healthy = config.channels.filter((channel) => channel.enabled && !openIds.includes(channel.id))
+  const notification = {
+    kind: 'relay.degraded',
+    sessionId: '*',
+    severity: 'high',
+    title: s.degradedTitle,
+    body: lines.join('\n'),
+    createdAt: new Date().toISOString(),
+  }
+  degradedNotifiedAt = now
+  if (healthy.length === 0) {
+    await recordDelivery({
+      event: 'relay.degraded',
+      title: notification.title,
+      channelId: '',
+      kind: '',
+      ok: false,
+      error: `no healthy channel to report through: ${lines.join('; ')}`.slice(0, 300),
+      ms: 0,
+    })
+    return { reported: true, delivered: false }
+  }
+  await deliver(notification, { channels: healthy, retry: false })
+  return { reported: true, delivered: true }
+}
+
+/* ------------------------------------------------------------------ *
  * Digest
  * ------------------------------------------------------------------ */
 
-/** Flushes everything held into one notification per channel set. */
+/**
+ * Flushes everything held into one notification per channel set.
+ *
+ * The digest goes to the **union** of channels that wanted any of the held
+ * kinds, not to the channels that subscribe to the literal kind `'digest'`.
+ * That distinction shipped as a bug in 0.2.0: `channelsFor` matches on
+ * `notification.kind`, so a channel configured `events: ['task.failed']` - the
+ * README's own worked example - was filtered out of every digest and silently
+ * received nothing at all. A digest is a container for the kinds it holds, so it
+ * inherits their audience.
+ */
 async function flushDigest() {
   digestTimer = null
   if (digestQueue.length === 0) return { sent: 0 }
   const items = digestQueue
   digestQueue = []
+  const heldKinds = new Set(items.map((item) => item.kind))
+  const targets = config.channels.filter((channel) => {
+    if (!channel.enabled) return false
+    if (channel.events.includes('*')) return true
+    return channel.events.some((kind) => heldKinds.has(kind))
+  })
   const notification = {
     kind: 'digest',
     sessionId: '*',
+    severity: 'normal',
     title: t().digestTitle(items.length),
     body: items.map((item) => `\u2022 ${item.title}${item.body ? ` \u2014 ${item.body}` : ''}`).join('\n'),
     createdAt: new Date().toISOString(),
   }
-  const results = await deliver(notification)
+  const results = await deliver(notification, { channels: targets })
   await recordDelivery({
     channelId: '*',
     kind: 'digest',
@@ -976,13 +1350,21 @@ function armDigest() {
 
 /** Arms the outbox drain if it is not already running. */
 function armOutboxTimer(delay) {
-  if (outboxTimer || outbox.length === 0 || !hostCtx) return
+  if (outboxTimer || !hostCtx) return
+  /* Armed even with an empty outbox: the tick is also the self-monitor's
+     heartbeat, and a notifier that only checks its own health while it has
+     pending work never notices that it has stopped working. */
   outboxTimer = hostCtx.timeout(() => {
-    void drainOutbox().then(() => {
-      /* Re-arm only if work is still pending, so a drained outbox leaves no
-         timer behind. */
-      if (outbox.length > 0) armOutboxTimer(delay)
-    })
+    void (async () => {
+      await drainOutbox()
+      await reportDegraded()
+      /* Re-arm while the relay is on. This is a heartbeat, not a work queue:
+         the Healthchecks model is a Period plus a Grace Time, and a heartbeat
+         that stops when the queue is empty cannot detect the one failure it
+         exists to catch - a relay that is enabled and quietly delivering
+         nothing. */
+      if (config.enabled) armOutboxTimer(delay)
+    })()
   }, delay)
 }
 
@@ -1015,8 +1397,27 @@ async function intake(kind, payload) {
   const source = isPlainObject(payload) ? payload : {}
   const sessionId = String(source.sessionId ?? source.session?.id ?? source.agent?.session?.id ?? '')
   const title = String(source.title ?? source.sessionTitle ?? source.label ?? '')
-  const body = String(source.detail ?? source.message ?? source.cause ?? source.reason ?? source.error ?? '')
-  const notification = { kind, sessionId, title, body, createdAt: new Date().toISOString() }
+  /* Several host payloads carry their prose in a structured field rather than a
+     string — `turn/end`'s `reason` is an object, `tool/result`'s `error` is one
+     too — and `String()` on those yields the useless "[object Object]". Treat
+     that as no detail at all rather than shipping it as the message body. */
+  const rawBody = source.detail ?? source.message ?? source.cause ?? source.reason ?? source.error
+  const body = typeof rawBody === 'string' && rawBody.trim() !== '' ? rawBody : ''
+  /* A notification with no body and no title is an empty push. Several events
+     really do carry no prose — a `turn/end` with no summary is the common one —
+     and shipping a blank message is how a user learns to distrust the channel.
+     Say what happened instead of saying nothing, and be explicit that the
+     source supplied no detail so a genuine gap is not mistaken for a bug. */
+  const resolvedBody = body || (config.language === 'en' ? `(no detail supplied by the ${kind} event)` : `（${kind} 事件未提供细节）`)
+  const resolvedTitle = title || (config.language === 'en' ? 'DSH notification' : 'DSH 通知')
+  const notification = {
+    kind,
+    sessionId,
+    title: resolvedTitle,
+    body: resolvedBody,
+    severity: severityOf(kind),
+    createdAt: new Date().toISOString(),
+  }
 
   const decision = classify(notification)
   if (decision.verdict === 'send') {
@@ -1062,8 +1463,19 @@ function notifyCommand() {
           `${s.statusOutbox(outbox.length)}`,
         ]
         if (mutedUntil > Date.now()) lines.push(s.statusMuted(new Date(mutedUntil).toISOString()))
-        const last = log.find((entry) => !entry.suppressed)
-        if (last) lines.push(`${config.language === 'en' ? 'last delivery' : '最近投递'}: ${last.ok ? 'ok' : 'failed'} (${last.channelId || last.event || '-'})`)
+        /* Health lines. A status command that reports "enabled: yes, outbox: 0"
+           for a relay whose channels are all dead is exactly the false
+           reassurance this command exists to prevent, so the breaker state and
+           the age of the last successful delivery are reported here too. */
+        const openIds = openBreakerIds()
+        if (openIds.length > 0) lines.push(s.statusBreakers(openIds.join(', ')))
+        if (outbox.length > 0) {
+          const oldest = Math.min(...outbox.map((item) => item.firstSeenAt || Date.now()))
+          lines.push(s.statusOldest(humanAge(Date.now() - oldest)))
+        }
+        const lastOk = log.find((entry) => !entry.suppressed && entry.ok)
+        if (lastOk) lines.push(s.statusLastOk(humanAge(Date.now() - new Date(lastOk.at).getTime())))
+        else if (config.enabled && config.channels.some((c) => c.enabled)) lines.push(s.degradedNever)
         return { kind: 'success', text: lines.join('\n') }
       }
 
@@ -1086,7 +1498,7 @@ function notifyCommand() {
           createdAt: new Date().toISOString(),
         }
         const results = []
-        for (const channel of targets) results.push(await deliverTo(channel, notification, { event: 'test', title: notification.title }))
+        for (const channel of targets) results.push(await deliverTo(channel, notification, { event: 'test', title: notification.title, severity: 'normal' }))
         const failed = results.filter((r) => !r.ok)
         if (failed.length > 0) {
           return { kind: 'error', text: s.testFailed(failed.map((f) => `${f.channelId} (${f.error ?? f.status})`).join(', ')) }
@@ -1230,6 +1642,10 @@ function registerRoutes(webServer) {
             await persistConfig()
             if (config.digest.enabled && digestQueue.length > 0) armDigest()
             if (!config.digest.enabled) disarmDigest()
+            /* Turning the relay on from the settings page must start the
+               heartbeat too, or a freshly configured relay has no self-monitor
+               until the next restart. */
+            if (config.enabled) armOutboxTimer(Math.max(1, config.digest.intervalMinutes) * 60_000)
             sendJson(res, 200, { ok: true, config: redactConfig(config) })
             return
           }
@@ -1245,6 +1661,11 @@ function registerRoutes(webServer) {
             held: digestQueue.length,
             muted: mutedUntil > Date.now(),
             pending: outbox.length,
+            /* Which channels the breaker has stopped calling, and how long
+               until the half-open probe. The editor needs this to explain why a
+               channel that is configured correctly is not receiving anything -
+               otherwise a tripped breaker looks identical to a config bug. */
+            breakers: breakerSummary(),
           })
         }),
       },
@@ -1292,7 +1713,7 @@ function registerRoutes(webServer) {
             createdAt: new Date().toISOString(),
           }
           const results = []
-          for (const channel of targets) results.push(await deliverTo(channel, notification, { event: 'test', title: notification.title }))
+          for (const channel of targets) results.push(await deliverTo(channel, notification, { event: 'test', title: notification.title, severity: 'normal' }))
           sendJson(res, 200, { ok: true, results })
         }),
       },
@@ -1324,11 +1745,11 @@ function registerRoutes(webServer) {
         path: `${ROUTE_PREFIX}/retry`,
         handler: guarded(async (req, res) => {
           if (req.method !== 'POST') {
-            sendJson(res, 200, { ok: true, pending: outbox.length })
+            sendJson(res, 200, { ok: true, pending: outbox.length, breakers: breakerSummary() })
             return
           }
           const result = await drainOutbox({ force: true })
-          sendJson(res, 200, { ok: true, ...result, pending: outbox.length })
+          sendJson(res, 200, { ok: true, ...result, pending: outbox.length, breakers: breakerSummary() })
         }),
       },
       log,
@@ -1369,11 +1790,14 @@ export async function apply(ctx) {
   /* A restart must resume the retry queue, not drop it. This is the whole
      reason the outbox is persisted: an in-memory queue loses every pending
      retry on restart, which is the documented limitation of the best
-     competitor in this ecosystem. */
-  if (outbox.length > 0) {
-    log.info(`${outbox.length} notification(s) awaiting retry after restart`)
-    armOutboxTimer(Math.max(1, config.digest.intervalMinutes) * 60_000)
-  }
+     competitor in this ecosystem.
+
+     The timer is armed when the relay is enabled, whether or not the outbox is
+     non-empty, because the same tick is the self-monitor's heartbeat. Arming it
+     only when work is pending would mean a relay whose channels are all broken -
+     and which therefore has nothing to retry - never checks itself. */
+  if (outbox.length > 0) log.info(`${outbox.length} notification(s) awaiting retry after restart`)
+  if (config.enabled) armOutboxTimer(Math.max(1, config.digest.intervalMinutes) * 60_000)
 
   ctx.effect(() => {
     let disposeCommands = () => {}

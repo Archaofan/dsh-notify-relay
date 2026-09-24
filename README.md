@@ -107,6 +107,7 @@ every load — a bad value falls back to the default rather than crashing:
   "dedup": { "windowMinutes": 10 },
   "quiet": { "enabled": false, "start": "22:00", "end": "08:00", "mode": "digest" },
   "digest": { "enabled": false, "intervalMinutes": 30 },
+  "deepLink": "",
   "channels": [
     {
       "id": "phone",
@@ -127,6 +128,107 @@ leaves the machine — the digest title, the `/notify` replies, the suppression
 reasons. The UI language still follows DSH's own setting, because the person
 reading the settings page and the person reading a push at 2am are not
 necessarily the same person. An unrecognised value falls back to `zh`.
+
+`deepLink` is optional. Only Bark (`url`) and ntfy (`Click`) have a native
+tap-target field; the other channels have no equivalent and get nothing rather
+than a URL pasted into the body where it is not clickable. It must be an
+`http(s)` URL containing `{session}`, which is substituted per notification —
+a link without a session is a lie, so it is not sent:
+
+```json
+"deepLink": "https://dsh.example.com/session/{session}"
+```
+
+## Severity
+
+A flat "it happened" is not enough. An approval request and a task-done are both
+events, but one costs you money if it is missed and the other is trivia. Every
+mature notification system separates severity from content; a notifier that
+cannot forces you to either miss the important one or be spammed by the
+unimportant one.
+
+| Kind | Severity |
+| --- | --- |
+| `approval.asked` | **critical** |
+| `task.failed`, `task.aborted`, `task.blocked`, `request.failed`, `tool.failed`, `relay.degraded` | high |
+| `task.done`, `approval.decided`, digest, test | normal |
+| (nothing maps to low; it exists so a channel can downgrade) | low |
+
+Severity is not decoration — it lands on real API fields, verified against the
+vendor docs:
+
+| Channel | Field | Critical | Normal |
+| --- | --- | --- | --- |
+| Bark | `level` | `critical` + `call: '1'` + `volume: '10'` | `active` |
+| Bark | — | low → `passive`, high → `timeSensitive` | |
+| ntfy | `Priority` | `5` | `3` (low → `2`, high → `4`) |
+| Telegram | `disable_notification` | `false` | `true` only for `low` |
+| webhook | JSON `severity` | `"critical"` | `"normal"` |
+
+Bark's `critical` + `call` is the only primitive in this plugin's whole channel
+set that breaks through iOS silent mode and Do Not Disturb. It is reserved for
+approval requests, because using it for anything else is how a notifier gets
+uninstalled. Server酱, WeCom and Feishu have no severity primitive at all, so
+they keep their existing shape — inventing a field the API ignores is worse than
+omitting one.
+
+## Circuit breakers
+
+Without one, a channel that is hard down — revoked token, decommissioned host,
+DNS that stopped resolving — is retried on every single notification, six times
+each, forever. Each retry costs a full timeout, so the outbox grows, the backoff
+ceiling stretches to thirty minutes, and your **working** channels are delayed
+behind the dead one.
+
+Three consecutive failures open a channel's breaker. It then gets no requests at
+all until the cooldown elapses (1m → 5m → 15m → 30m, doubling from one minute),
+when exactly one probe goes out. A success resets everything, including the
+ladder, so a channel that recovers does not carry a longer penalty than it
+earned.
+
+Two deliberate choices:
+
+- **A tripped channel is not queued for retry.** Retrying it per-notification is
+  the behaviour the breaker exists to stop. The skip is still written to the log
+  with `error: "circuit open"` — a silent skip is the exact failure this plugin
+  was written to eliminate.
+- **Breakers are not persisted.** A breaker is a statement about the network
+  *now*, and a restart is exactly when the network may have been fixed. Re-tripping
+  after a restart costs three attempts; trusting a stale "unhealthy" flag across a
+  restart could suppress a channel for thirty minutes for no reason.
+
+The channel card in the settings page shows the breaker state and how long until
+the probe, so a tripped channel explains itself instead of looking like a config
+bug.
+
+## The relay reports on itself
+
+This is the single highest-leverage thing a notifier can do, and the one this
+plugin was missing. A notifier that quietly stops notifying is **strictly worse
+than no notifier**, because you believe you are covered. Healthchecks.io is built
+on exactly this idea — a Period plus a Grace Time, so that *silence* is itself an
+alert.
+
+Every tick of the heartbeat timer (the same one that drains the outbox) checks
+three things and, at most once an hour, warns you through a **healthy** channel:
+
+- a channel whose breaker is open, with its id
+- notifications stuck in the retry queue for more than 30 minutes, with their age
+- nothing delivered at all since start-up, with an enabled channel configured
+
+It is deliberately conservative. Once an hour, because a warning that fires on
+every tick trains you to ignore it. Only through a healthy channel, because
+warning through the dead one adds a failure to the thing being reported and could
+recurse. Never queued for retry, because a degraded warning that fails must not
+join the outbox it is describing. And never through `classify()`, because
+`relay.degraded` is not a user-configurable event and the event switches must not
+be able to silence it.
+
+If every channel is open there is nobody to tell, so the warning is recorded as a
+log row instead — at least it is visible to the one person who opens the panel.
+
+`/notify status` reports the same state on demand: breaker ids, the age of the
+oldest queued item, and how long since the last successful delivery.
 
 ## Where the events come from
 
@@ -173,6 +275,22 @@ out (10s) or refuses the connection is recorded as `failed` in the log and the
 other channels still get their message. Concurrency is capped at 3 so a
 misconfigured endpoint cannot flood the socket.
 
+Backoff is exponential with **bounded jitter**: 30s, 1m, 2m, 4m … capped at 30
+minutes, then multiplied by a uniform draw in `[0.75, 1.25]`. Without jitter every
+pending item computes the *same* next-attempt time, so the moment a shared channel
+recovers — or the moment the process restarts and reloads the whole outbox at
+once — every queued notification fires at it simultaneously. A notifier whose own
+failure mode is "many things failed at once" is precisely the case that produces a
+thundering herd. The bound is ±25% rather than full `[0, cap]` jitter, because
+full jitter can schedule a retry effectively immediately, which for a 10s-timeout
+channel means a hot loop.
+
+A digest inherits the audience of the kinds it holds. That distinction shipped as
+a bug in 0.2.0: the digest was delivered with `kind: 'digest'`, so `channelsFor`
+matched it against each channel's `events` list and filtered it out — a channel
+configured `events: ['task.failed']`, which is this README's own worked example,
+silently received no digest at all.
+
 ## Verification
 
 This plugin was not shipped on the strength of "it looks right". Four gates,
@@ -180,7 +298,7 @@ all of which must pass, and three of which are designed to **fail**:
 
 | Gate | What it proves |
 | --- | --- |
-| `.sandbox/host-harness.cjs` | The fail-loud inject contract, the rule engine (dedup / quiet hours / payload builders / redaction), a **real HTTP delivery** to a loopback server, the durable outbox (enqueue / backoff / retry / give-up / restart recovery), and 10 broken-build variants |
+| `.sandbox/host-harness.cjs` | The fail-loud inject contract, the rule engine (dedup / quiet hours / severity mapping / payload builders / redaction), a **real HTTP delivery** to a loopback server, the deep link on the wire, the breaker state machine, the durable outbox (enqueue / backoff / retry / give-up / restart recovery), and **16 broken-build variants** |
 | `.sandbox/client-harness.cjs` | Materialization against a strict fake ctx, the inject contract, the settings-section thunk label across a language switch, dictionary key parity, the editor round-trip, **event-vocabulary parity with the host**, and 4 broken variants |
 | `.sandbox/live-check.cjs` | The plugin **booted inside a real DSH**: config write → read-back → real socket delivery → log → reset → `/retry` → delivery language |
 | `.sandbox/e2e-notify.mjs` | The browser half in a **real GUI**: pill, delivery panel, official settings section, and a UI change that round-trips through the host |

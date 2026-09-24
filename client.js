@@ -144,6 +144,13 @@ window.__ModuleLoader__.load({
       digestLabel: '摘要合批',
       digestHint: '开启后不逐条外发，而是按间隔合成一条摘要。',
       digestInterval: '间隔（分钟）',
+      deepLinkLabel: '点击跳转',
+      deepLinkHint: 'Bark 与 ntfy 支持点击通知打开链接，用 {session} 占位会话号。留空则不跳转；其他通道没有对应字段。',
+      breakerOpen: (m) => `该通道连续失败，已暂停重试，约 ${m} 分钟后自动重探`,
+      sevCritical: '紧急',
+      sevHigh: '重要',
+      sevNormal: '普通',
+      sevLow: '低',
       channelsTitle: '外联通道',
       channelsHint: '密钥仅保存在本机 DSH 数据目录，界面回显为掩码；留空表示保持原值。',
       secretPlaceholder: '留空保持原值',
@@ -236,6 +243,13 @@ window.__ModuleLoader__.load({
       digestLabel: 'Digest batching',
       digestHint: 'When on, notifications are folded into one summary per interval instead of sent one by one.',
       digestInterval: 'Interval (minutes)',
+      deepLinkLabel: 'Tap target',
+      deepLinkHint: 'Bark and ntfy open a link when the notification is tapped; {session} is replaced per notification. Leave empty for no link — the other channels have no field for it.',
+      breakerOpen: (m) => `This channel has failed repeatedly and retries are paused; it will be probed again in about ${m} minute${m === 1 ? '' : 's'}`,
+      sevCritical: 'critical',
+      sevHigh: 'high',
+      sevNormal: 'normal',
+      sevLow: 'low',
       channelsTitle: 'Channels',
       channelsHint: 'Secrets stay in the local DSH data directory and are echoed back masked; leave a field untouched to keep it.',
       secretPlaceholder: 'leave blank to keep',
@@ -333,6 +347,13 @@ window.__ModuleLoader__.load({
       '.dsh-relay-tag{flex:none;padding:0 5px;border-radius:4px;font-size:10px;font-weight:600;line-height:15px}',
       '.dsh-relay-tag[data-ok=true]{background:var(--dsw-alias-state-success-tertiary,#e6f4ee);color:var(--dsw-alias-state-success-primary,#22a06b)}',
       '.dsh-relay-tag[data-ok=false]{background:var(--dsw-alias-state-error-tertiary,#fdeceb);color:var(--dsw-alias-state-error-primary,#d54941)}',
+      /* Severity badge. Only rendered for non-normal rows, so a healthy log is
+         unchanged; a critical row is the one that must stand out. */
+      '.dsh-relay-sev{flex:none;padding:0 5px;border-radius:4px;font-size:10px;font-weight:600;line-height:15px;text-transform:uppercase}',
+      '.dsh-relay-sev[data-sev=critical]{background:var(--dsw-alias-state-error-tertiary,#fdeceb);color:var(--dsw-alias-state-error-primary,#d54941)}',
+      '.dsh-relay-sev[data-sev=high]{background:var(--dsw-alias-state-warning-tertiary,#fdf1e3);color:var(--dsw-alias-state-warning-primary,#c77f2a)}',
+      '.dsh-relay-sev[data-sev=low]{background:var(--dsw-alias-bg-secondary,#f7f8f9);color:var(--dsw-alias-label-tertiary,#81858c)}',
+      '.dsh-relay-warn{color:var(--dsw-alias-state-warning-primary,#c77f2a)}',
       '.dsh-relay-panel-actions{display:flex;gap:6px}',
       '.dsh-relay-btn{height:26px;padding:0 10px;border:0;border-radius:6px;background:var(--dsw-alias-interactive-bg-hover,#2631480f);color:var(--dsw-alias-label-primary,#0f1115);font:inherit;font-size:12px;cursor:pointer}',
       '.dsh-relay-btn:hover{background:var(--dsw-alias-interactive-bg-active,#2631481f)}',
@@ -346,7 +367,8 @@ window.__ModuleLoader__.load({
       '.dsh-relay-group-title{color:var(--dsw-alias-label-secondary,#4b4f56);font-size:12px;font-weight:600}',
       '.dsh-relay-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dsw-alias-label-primary,#0f1115)}',
       '.dsh-relay-row-between{justify-content:space-between}',
-      '.dsh-relay-row input[type=number],.dsh-relay-row input[type=time],.dsh-relay-row input[type=text],.dsh-relay-row select{height:26px;padding:0 6px;border:1px solid var(--dsw-alias-line-secondary,#e6e8eb);border-radius:6px;background:var(--dsw-alias-bg-primary,#fff);color:var(--dsw-alias-label-primary,#0f1115);font:inherit;font-size:12px}',
+      '.dsh-relay-row input[type=number],.dsh-relay-row input[type=time],.dsh-relay-row input[type=text],.dsh-relay-row input[type=url],.dsh-relay-row select{height:26px;padding:0 6px;border:1px solid var(--dsw-alias-line-secondary,#e6e8eb);border-radius:6px;background:var(--dsw-alias-bg-primary,#fff);color:var(--dsw-alias-label-primary,#0f1115);font:inherit;font-size:12px}',
+      '.dsh-relay-row input[type=url]{width:100%;max-width:420px}',
       '.dsh-relay-row input[type=number]{width:72px}',
       '.dsh-relay-row input[type=time]{width:92px}',
       '.dsh-relay-field{display:flex;flex-direction:column;gap:3px}',
@@ -383,10 +405,23 @@ window.__ModuleLoader__.load({
       return {
         enabled: false,
         language: 'zh',
-        events: { 'task.done': false, 'task.failed': true, 'request.failed': true, 'approval.asked': true },
+        /* Must mirror EVENT_IDS exactly — this object seeds the editor draft, so
+           a kind present in EVENT_IDS but absent here renders a switch with an
+           undefined `checked`. */
+        events: {
+          'task.done': false,
+          'task.failed': true,
+          'task.aborted': true,
+          'task.blocked': true,
+          'request.failed': true,
+          'approval.asked': true,
+          'approval.decided': false,
+          'tool.failed': true,
+        },
         dedup: { windowMinutes: 10 },
         quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
         digest: { enabled: false, intervalMinutes: 30 },
+        deepLink: '',
         channels: [],
       }
     }
@@ -400,6 +435,9 @@ window.__ModuleLoader__.load({
       muted: false,
       /** Failed deliveries waiting for a retry (the durable outbox). */
       pending: 0,
+      /** Per-channel circuit-breaker state, so a tripped channel can explain
+       *  itself instead of looking like a config bug. */
+      breakers: {},
     }
 
     const listeners = new Set()
@@ -478,6 +516,10 @@ window.__ModuleLoader__.load({
           enabled: raw.digest?.enabled === true,
           intervalMinutes: minutes(raw.digest?.intervalMinutes, base.digest.intervalMinutes),
         },
+        /* Only an http(s) URL survives. The host rejects everything else, and
+           mirroring that here means the editor never shows a link the host will
+           silently drop on the next save. */
+        deepLink: typeof raw.deepLink === 'string' && /^https?:\/\/\S*\{session\}\S*$/.test(raw.deepLink.trim()) ? raw.deepLink.trim() : '',
         channels: (Array.isArray(raw.channels) ? raw.channels.map(normalizeChannel).filter(Boolean) : []).slice(0, 20),
       }
     }
@@ -491,6 +533,9 @@ window.__ModuleLoader__.load({
            nothing about what was delivered. */
         event: typeof raw.event === 'string' ? raw.event : '',
         title: typeof raw.title === 'string' ? raw.title : '',
+        /* How loud this row was allowed to be. Absent on rows written before
+           the severity ladder existed, which is why the badge is optional. */
+        severity: typeof raw.severity === 'string' ? raw.severity : '',
         channelId: typeof raw.channelId === 'string' ? raw.channelId : '',
         kind: typeof raw.kind === 'string' ? raw.kind : '',
         ok: raw.ok === true,
@@ -511,6 +556,7 @@ window.__ModuleLoader__.load({
       state.held = Number.isFinite(data.held) ? data.held : 0
       state.muted = data.muted === true
       state.pending = Number.isFinite(data.pending) ? data.pending : 0
+      state.breakers = data.breakers && typeof data.breakers === 'object' ? data.breakers : {}
       state.loaded = true
       emitChange()
     }
@@ -605,6 +651,12 @@ window.__ModuleLoader__.load({
         createElement('span', { className: 'dsh-relay-tag', 'data-ok': entry.ok ? 'true' : 'false' }, tag),
         createElement('span', { className: 'dsh-relay-log-time' }, shortTime(entry.at)),
         createElement('span', { className: 'dsh-relay-log-chan' }, entry.event || entry.channelId || entry.kind || '-'),
+        /* Severity, when the row carries one. `approval.asked` and `task.done`
+           are both "ok", and a log that cannot tell them apart cannot answer
+           "was anything important delivered?". */
+        entry.severity && entry.severity !== 'normal'
+          ? createElement('span', { className: 'dsh-relay-sev', 'data-sev': entry.severity }, t[`sev${entry.severity}`] || entry.severity)
+          : null,
         createElement('span', { className: 'dsh-relay-log-detail' }, detail),
       )
     }
@@ -858,6 +910,25 @@ window.__ModuleLoader__.load({
           ),
         ),
 
+        /* Tap target. Channels that support one (Bark `url`, ntfy `Click`) turn a
+           notification into a link; the rest have no field for it and get
+           nothing. `{session}` is substituted per notification, so a template
+           without it is rejected rather than silently producing a link to
+           somewhere unrelated. */
+        createElement(
+          'div',
+          { className: 'dsh-relay-group' },
+          createElement('div', { className: 'dsh-relay-group-title' }, t.deepLinkLabel),
+          createElement('div', { className: 'dsh-relay-hint' }, t.deepLinkHint),
+          createElement('input', {
+            type: 'url',
+            placeholder: 'https://dsh.example.com/?session={session}',
+            value: draft.deepLink,
+            'data-testid': 'relay-deeplink',
+            onChange: (event) => patch({ deepLink: event.target.value }),
+          }),
+        ),
+
         /* Channels. */
         createElement(
           'div',
@@ -869,6 +940,12 @@ window.__ModuleLoader__.load({
               key: channel.id,
               channel,
               busy: busy,
+              /* Live breaker state for this channel: open, why, and how long
+                 until the half-open probe. A tripped breaker and a typo'd
+                 endpoint look identical from the config alone, and telling them
+                 apart is the difference between "wait a minute" and "debug your
+                 token". */
+              breaker: snapshot.breakers?.[channel.id] || null,
               onChange: (changes) => patchChannel(channel.id, changes),
               onTest: () => onTest(channel.id),
               onDelete: () =>
@@ -931,8 +1008,9 @@ window.__ModuleLoader__.load({
     }
 
     /** One channel editor card. */
-    function ChannelCard({ channel, busy, onChange, onTest, onDelete }) {
+    function ChannelCard({ channel, busy, breaker, onChange, onTest, onDelete }) {
       const spec = CHANNEL_KINDS.find((c) => c.id === channel.kind) ?? CHANNEL_KINDS[0]
+      const open = breaker?.open === true
       return createElement(
         'div',
         { className: 'dsh-relay-channel' },
@@ -968,6 +1046,16 @@ window.__ModuleLoader__.load({
             testId: 'relay-channel-enabled',
           }),
         ),
+
+        /* Circuit-breaker state. Rendered only when the breaker is actually
+           open, so a healthy channel card is unchanged. */
+        open
+          ? createElement(
+              'div',
+              { className: 'dsh-relay-hint dsh-relay-warn', 'data-testid': 'relay-breaker-open' },
+              t.breakerOpen(Math.max(1, Math.ceil((breaker.retryInMs || 0) / 60000))),
+            )
+          : null,
 
         /* Endpoint (ntfy / webhook only). */
         spec.urlField

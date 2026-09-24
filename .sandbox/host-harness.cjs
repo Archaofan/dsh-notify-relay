@@ -150,6 +150,23 @@ function makeCtx(injectList, services) {
     base[name] = service
   }
 
+  /* A mixin service installs its methods DIRECTLY on the context, so the plugin
+     writes `ctx.timeout(...)`, not `ctx.timer.timeout(...)`. Both spellings must
+     therefore work, and the fail-loud proxy must allow the method names whenever
+     the mixin service itself is declared. Installing them here — rather than
+     passing `timer: { timeout }` as a service — is what keeps every caller
+     (main run, bootInstance, probeOutbox, the variant runner) faithful at once;
+     passing it as a service is exactly the fidelity bug that made the timer
+     surface invisible to the variant runner. */
+  for (const [service, methods] of Object.entries(MIXIN_SURFACE)) {
+    if (!injectList.includes(service)) continue
+    const impl = services[service] || {}
+    for (const method of methods) {
+      if (base[method] !== undefined) continue
+      base[method] = typeof impl[method] === 'function' ? impl[method] : () => () => {}
+    }
+  }
+
   return new Proxy(base, {
     get(target, prop, receiver) {
       if (typeof prop === 'symbol') return Reflect.get(target, prop, receiver)
@@ -310,6 +327,142 @@ function testBuildDelivery(mod) {
   /* A secret with URL-hostile characters must not corrupt the endpoint. */
   const weird = buildDelivery({ id: 'c', kind: 'bark', secrets: { key: 'a b/c?d' }, url: '' }, note)
   check('bark key is url-encoded', !!weird.url && weird.url.includes('a%20b%2Fc%3Fd'), weird.url)
+}
+
+/* ------------------------------------------------------------------ *
+ * Severity ladder, deep links, jittered backoff and the breaker.
+ *
+ * These are the v0.3.0 features, and each one is asserted here because each one
+ * is invisible when it works: a payload that omits `level` still delivers, a
+ * deep link that is silently dropped still delivers, a breaker that never trips
+ * still delivers. Only a green gate proves they are present.
+ * ------------------------------------------------------------------ */
+
+function testSeverity(mod) {
+  const { SEVERITY_BY_KIND, severityOf, SEVERITIES } = mod
+
+  check('severities are the four real ones', SEVERITIES.join(',') === 'critical,high,normal,low', SEVERITIES.join(','))
+  check('an approval is critical', severityOf('approval.asked') === 'critical', severityOf('approval.asked'))
+  check('a failure is high', severityOf('task.failed') === 'high', severityOf('task.failed'))
+  check('a completed turn is normal', severityOf('task.done') === 'normal', severityOf('task.done'))
+  check('a self-report is high, not critical', severityOf('relay.degraded') === 'high', severityOf('relay.degraded'))
+  /* Total: an unknown kind must never crash the payload builders. */
+  check('an unknown kind is normal', severityOf('who.knows') === 'normal', severityOf('who.knows'))
+
+  /* Every configured kind must have a severity, or the ladder has a hole. */
+  const missing = mod.EVENT_KINDS.filter((k) => !SEVERITY_BY_KIND[k.id]).map((k) => k.id)
+  check('every event kind has a severity', missing.length === 0, missing.join(','))
+
+  /* The mapping must be asserted against the REAL vendor fields, not against a
+     comment. A payload that omits `level` still delivers, so the only way to
+     catch a dropped mapping is to decode the body. */
+  const note = { kind: 'approval.asked', title: 'Approve', body: 'bash rm -rf', sessionId: 's1', severity: 'critical', createdAt: 'x' }
+  const bark = JSON.parse(mod.buildDelivery({ id: 'c', kind: 'bark', secrets: { key: 'K' }, url: '' }, note).init.body)
+  check('bark critical maps to level critical', bark.level === 'critical', JSON.stringify(bark))
+  check('bark critical also rings through DND', bark.call === '1', JSON.stringify(bark))
+
+  const normal = mod.buildDelivery(
+    { id: 'c', kind: 'bark', secrets: { key: 'K' }, url: '' },
+    { ...note, kind: 'task.done', severity: 'normal' },
+  )
+  const normalBody = JSON.parse(normal.init.body)
+  check('bark normal is active, not critical', normalBody.level === 'active', JSON.stringify(normalBody))
+  /* The most important negative assertion in the file: a task-done that rang
+     through Do Not Disturb would get the plugin uninstalled. */
+  check('bark normal does not ring through DND', normalBody.call === undefined, JSON.stringify(normalBody))
+
+  const low = JSON.parse(
+    mod.buildDelivery({ id: 'c', kind: 'bark', secrets: { key: 'K' }, url: '' }, { ...note, severity: 'low' }).init.body,
+  )
+  check('bark low is passive', low.level === 'passive', JSON.stringify(low))
+
+  const ntfy = mod.buildDelivery({ id: 'c', kind: 'ntfy', secrets: {}, url: 'https://ntfy.sh/t' }, note)
+  check('ntfy critical is priority 5', ntfy.init.headers.priority === '5', JSON.stringify(ntfy.init.headers))
+  check(
+    'ntfy low is priority 2',
+    mod.buildDelivery({ id: 'c', kind: 'ntfy', secrets: {}, url: 'https://ntfy.sh/t' }, { ...note, severity: 'low' }).init.headers
+      .priority === '2',
+  )
+
+  const tg = JSON.parse(
+    mod.buildDelivery({ id: 'c', kind: 'telegram', secrets: { token: 'T', chatId: '1' }, url: '' }, { ...note, severity: 'low' }).init
+      .body,
+  )
+  check('telegram low is silent', tg.disable_notification === true, JSON.stringify(tg))
+  const tgLoud = JSON.parse(
+    mod.buildDelivery({ id: 'c', kind: 'telegram', secrets: { token: 'T', chatId: '1' }, url: '' }, note).init.body,
+  )
+  check('telegram critical is not silenced', tgLoud.disable_notification === false, JSON.stringify(tgLoud))
+
+  const hook = JSON.parse(
+    mod.buildDelivery({ id: 'c', kind: 'webhook', secrets: { token: 'X' }, url: 'https://example.com/h' }, note).init.body,
+  )
+  check('webhook carries severity as data', hook.severity === 'critical', JSON.stringify(hook))
+}
+
+function testDeepLink(mod) {
+  const { validateConfig } = mod
+  const channel = { id: 'c1', kind: 'bark', secrets: { key: 'K' }, enabled: true, events: ['*'] }
+
+  const base = { channels: [channel] }
+  const bad = [
+    ['no placeholder', 'https://dsh.example.com/'],
+    ['javascript scheme', 'javascript:alert(1)?session={session}'],
+    ['file scheme', 'file:///etc/passwd?session={session}'],
+    ['plain text', 'open the app'],
+  ]
+  for (const [label, value] of bad) {
+    const checked = validateConfig({ ...base, deepLink: value })
+    check(`deepLink rejected: ${label}`, checked.ok && checked.value.deepLink === '', JSON.stringify(checked.value?.deepLink))
+  }
+
+  const good = validateConfig({ ...base, deepLink: 'https://dsh.example.com/?s={session}' })
+  check('deepLink accepted', good.ok && good.value.deepLink === 'https://dsh.example.com/?s={session}', good.value?.deepLink)
+  check('deepLink defaults to empty', validateConfig(base).value.deepLink === '')
+
+  /* Substitution itself is asserted in the apply() section, where a real
+     `config` object exists: `linkFor` reads module state, and this rule-engine
+     section runs before `apply()` has loaded anything, so it can only prove the
+     validator, not the substitution. */
+}
+
+function testBackoffJitter(mod) {
+  /* The backoff function is exported for exactly this: the jitter must be
+     bounded, or a full-jitter schedule can fire a retry immediately and turn a
+     10s-timeout channel into a hot loop. */
+  const { backoffMs } = mod
+  const draws = [0, 0.25, 0.5, 0.75, 1]
+  for (const attempt of [1, 2, 3, 4, 5, 9]) {
+    const base = Math.min(30_000 * 2 ** Math.max(0, attempt - 1), 30 * 60_000)
+    for (const rand of draws) {
+      const value = backoffMs(attempt, () => rand)
+      check(
+        `backoff(${attempt}, rand=${rand}) stays within [0.75, 1.25]x`,
+        value >= Math.floor(base * 0.75) && value <= Math.ceil(base * 1.25),
+        `${value} vs base ${base}`,
+      )
+    }
+  }
+  /* The jitter must actually vary, or it is not jitter. */
+  const spread = new Set([backoffMs(3, () => 0), backoffMs(3, () => 0.5), backoffMs(3, () => 1)])
+  check('jitter produces distinct delays', spread.size === 3, [...spread].join(','))
+  /* The exponential curve must survive the jitter. */
+  check('attempt 1 is roughly 30s', backoffMs(1, () => 0.5) === 30_000, String(backoffMs(1, () => 0.5)))
+  check('the curve is capped at 30 minutes', backoffMs(99, () => 0.5) === 30 * 60_000, String(backoffMs(99, () => 0.5)))
+}
+
+function testBreaker(mod) {
+  const { breakerOpen } = mod
+  const t0 = 1_700_000_000_000
+
+  check('an unseen channel is closed', breakerOpen('nobody', t0) === false)
+  check('the cooldown ladder starts at one minute', mod.CHANNEL_COOLDOWN_STEPS_MS[0] === 60_000, String(mod.CHANNEL_COOLDOWN_STEPS_MS[0]))
+  check(
+    'the cooldown ladder tops out at thirty minutes',
+    Math.max(...mod.CHANNEL_COOLDOWN_STEPS_MS) === 30 * 60_000,
+    String(Math.max(...mod.CHANNEL_COOLDOWN_STEPS_MS)),
+  )
+  check('three failures trip the breaker', mod.MAX_CHANNEL_FAILURES === 3, String(mod.MAX_CHANNEL_FAILURES))
 }
 
 function testRedaction(mod) {
@@ -551,8 +704,13 @@ async function testApply(mod) {
     check(`route ${route.path} declares no method`, route.method === undefined, String(route.method))
   }
 
-  /* ---- the digest timer is armed through the official timer service ---- */
-  check('no timer armed before any event', timers.length === 0)
+  /* ---- the timer service is used for the heartbeat ----
+
+     A disabled relay arms nothing. An enabled one arms the heartbeat even with
+     an empty queue, because the same tick is the self-monitor's only chance to
+     notice that it has stopped delivering — a heartbeat that stops when the
+     queue empties cannot detect the failure it exists to catch. */
+  check('a disabled relay arms no timer', timers.length === 0, `${timers.length} timers`)
 
   /* Declared here because the dispatch block below needs it to clear the mute
      that `/notify mute 30` leaves set — a muted relay logs nothing, so every
@@ -701,6 +859,160 @@ async function testApply(mod) {
 
   const noChannel = await command.handler({ ...invocation, rawInput: 'test' })
   check('/notify test with no channel is an error', noChannel.kind === 'error', noChannel.text)
+
+  /* ---- the deep link reaches the wire ----
+
+     Configure a channel plus a link template through the real /config route,
+     then fire a real session event and decode the request the plugin actually
+     sent. This is the only way to prove the substitution happens: `linkFor`
+     reads module state, so a rule-engine unit test cannot reach it.
+
+     The fetch stub is installed HERE and removed HERE, not at the top of the
+     test: `realDeliveryTest` above needs the real loopback HTTP server, and a
+     stub installed early silently starves it. */
+  const configRoute = routes.find((route) => route.path === '/notify-relay/config')
+  check('the config route exists to drive', !!configRoute)
+  if (configRoute && currentSessionListener) {
+    const sent = []
+    const realFetch = globalThis.fetch
+    const restoreFetch = () => {
+      globalThis.fetch = realFetch
+    }
+    try {
+      const postConfig = (config) =>
+        callRouteByPath(routes, '/notify-relay/config', {
+          method: 'POST',
+          /* An object, not a string: callRoute JSON-encodes the body itself, and
+             pre-encoding it here would send a quoted string that the plugin's
+             body parser reads as `undefined`. */
+          body: { config },
+        })
+      const saved = await postConfig({
+        enabled: true,
+        language: 'en',
+        deepLink: 'https://dsh.example.com/s/{session}',
+        channels: [{ id: 'c1', kind: 'bark', secrets: { key: 'K' }, enabled: true, events: ['*'] }],
+      })
+      check('a config with a deep link saves', saved?.body?.ok === true, JSON.stringify(saved?.body?.config?.deepLink))
+
+      /* Clear the mute the dispatch block above leaves set. A muted relay logs
+         nothing at all, so every assertion below would report "muted" rather
+         than the verdict it is actually testing. */
+      await command.handler({ ...invocation, rawInput: 'unmute' })
+
+      globalThis.fetch = async (url, init) => {
+        sent.push({ url: String(url), init })
+        return { ok: true, status: 200 }
+      }
+
+      /* The listener is fire-and-forget by design — the wrapper in apply() does
+         `void Promise.resolve(handler(...))` so a slow channel cannot block the
+         agent loop. So the assertions below must wait for the delivery to land
+         rather than sampling once. */
+      sent.length = 0
+      await currentSessionListener({ id: 'sess-42' }, { type: 'approval/asked', data: { toolName: 'bash', reason: 'run rm -rf' } })
+      await waitFor(() => sent.some((entry) => entry.url.includes('api.day.app')), 'an approval reached the channel')
+      const approval = sent.find((entry) => entry.url.includes('api.day.app'))
+      check('an approval reached the channel', !!approval, sent.map((s) => s.url).join(' | '))
+      if (approval) {
+        const payload = JSON.parse(String(approval.init.body))
+        check('the deep link carries the real session id', payload.url === 'https://dsh.example.com/s/sess-42', JSON.stringify(payload))
+        check('an approval is critical on the wire', payload.level === 'critical', JSON.stringify(payload))
+        check('an approval rings through DND', payload.call === '1', JSON.stringify(payload))
+      }
+
+      /* ---- the digest reaches the channels that wanted the held kinds ----
+
+         This is the bug 0.2.0 shipped. `flushDigest` used to deliver with
+         `kind: 'digest'`, so `channelsFor` matched it against each channel's
+         `events` list and filtered it out — a channel configured
+         `events: ['task.failed']`, which is the README's own worked example,
+         silently received no digest at all. The fix is that a digest inherits
+         the audience of the kinds it holds. A channel subscribing ONLY to
+         `task.failed` must receive a digest that holds a `task.failed`. */
+      const digestSaved = await postConfig({
+        enabled: true,
+        language: 'en',
+        digest: { enabled: true, intervalMinutes: 30 },
+        events: { 'task.done': true, 'task.failed': true, 'request.failed': true, 'approval.asked': true },
+        channels: [{ id: 'c2', kind: 'bark', secrets: { key: 'K2' }, enabled: true, events: ['task.failed'] }],
+      })
+      check('a digest config saves', digestSaved?.body?.ok === true, JSON.stringify(digestSaved?.body?.config?.digest))
+
+      sent.length = 0
+      await currentSessionListener(
+        { id: 'sess-9' },
+        { type: 'turn/end', data: { reason: { kind: 'error' } } },
+      )
+      await waitFor(
+        async () => {
+          const cfg = await callRouteByPath(routes, '/notify-relay/config', { method: 'GET' })
+          return cfg.body.held > 0
+        },
+        'a failure is held for the digest',
+      )
+      const heldNow = await callRouteByPath(routes, '/notify-relay/config', { method: 'GET' })
+      check('a failure is held for the digest', heldNow.body.held > 0, String(heldNow.body.held))
+
+      const flushed = await callRouteByPath(routes, '/notify-relay/flush', { method: 'GET' })
+      check('flush answers ok', flushed?.body?.ok === true, JSON.stringify(flushed?.body))
+      await waitFor(() => sent.some((entry) => entry.url.includes('api.day.app/K2')), 'a digest reaches a task.failed-only channel')
+      const digestHit = sent.find((entry) => entry.url.includes('api.day.app/K2'))
+      check('a digest delivers through a task.failed-only channel', !!digestHit, sent.map((s) => s.url).join(' | '))
+      if (digestHit) {
+        const payload = JSON.parse(String(digestHit.init.body))
+        check('the digest body lists the held item', String(payload.body).includes('task.failed'), JSON.stringify(payload.body))
+        /* A digest has no single session. Sending a link that opens some other
+           session than the one the notification is about is worse than no link. */
+        check('a digest carries no link', payload.url === undefined, JSON.stringify(payload))
+      }
+
+      /* ---- the circuit breaker ----
+
+         Three consecutive failures on one channel open it; the fourth
+         notification must not reach the network at all, and must not be queued
+         for retry either — that is the behaviour the breaker exists to stop.
+         Driven through `agent/error`, which is a real global listener, not
+         through `session/event`: firing the wrong listener proves nothing.
+
+         Digest is switched off first, because a held notification is never
+         delivered and therefore never fails — testing the breaker while batching
+         is on would measure the digest, not the breaker. */
+      const agentListener = eventHandlers.get('agent/error')
+      check('agent/error handler exists', typeof agentListener === 'function')
+      const breakerSaved = await postConfig({
+        enabled: true,
+        language: 'en',
+        digest: { enabled: false, intervalMinutes: 30 },
+        events: { 'task.done': true, 'task.failed': true, 'request.failed': true, 'approval.asked': true },
+        channels: [{ id: 'c2', kind: 'bark', secrets: { key: 'K2' }, enabled: true, events: ['task.failed'] }],
+      })
+      check('the breaker config saves', breakerSaved?.body?.ok === true, JSON.stringify(breakerSaved?.body?.config?.digest))
+      globalThis.fetch = async (url) => {
+        sent.push({ url: String(url) })
+        return { ok: false, status: 503 }
+      }
+      if (agentListener) {
+        /* Distinct titles: three identical events inside the dedup window are
+           one delivery, and one failure cannot open a breaker. */
+        for (let i = 0; i < 3; i++) await agentListener({ sessionId: `sess-bk${i}`, title: `bk-${i}`, detail: 'nope' })
+        await waitFor(() => mod.breakerOpen('c2') === true, 'three failures trip the breaker')
+        check('three failures trip the breaker', mod.breakerOpen('c2') === true)
+        sent.length = 0
+        await agentListener({ sessionId: 'sess-bk-after', title: 'bk-after', detail: 'nope again' })
+        await settle(300)
+        check('a tripped channel receives no request', sent.length === 0, `${sent.length} requests`)
+        await waitFor(
+          async () => (await readDeliveries()).some((row) => row.channelId === 'c2' && row.error === 'circuit open'),
+          'the skip is still logged',
+        )
+        const breakerRows = (await readDeliveries()).filter((row) => row.channelId === 'c2')
+        check('the skip is still logged', breakerRows.some((row) => row.error === 'circuit open'), JSON.stringify(breakerRows.slice(-1)))
+      }
+    } finally {
+      restoreFetch()
+    }
+  }
 
   restoreHome()
   fs.rmSync(scratch, { recursive: true, force: true })
@@ -1177,6 +1489,238 @@ async function outboxTest(mod, server, port, scratch, invocation, routes, readLo
 }
 
 /**
+ * Boots a variant plugin instance in isolation and drives it hard enough to see
+ * every v0.3.0 feature at once: severity on the wire, the breaker state machine,
+ * the digest audience, the jitter bounds, and whether the heartbeat re-arms.
+ *
+ * One probe rather than five, because booting a variant is the expensive part
+ * and every assertion here needs the same instance. The shallow checks in the
+ * variant loop only see registrations, and each of these features is invisible
+ * there: a build with no severity mapping still registers, still routes, and
+ * still delivers — it just delivers quietly.
+ */
+async function probeFeatures({ variantMod, scratch, makeCtx }) {
+  const storageDir = path.join(scratch, 'storages', 'notify-relay')
+  const outboxPath = path.join(storageDir, 'outbox.json')
+
+  /* The variant loop restores DSH_HOME in its own finally, which runs BEFORE
+     this probe. Without re-pointing it here, every write the plugin makes lands
+     in the real user home and the probe reads an empty scratch — the probe then
+     reports a clean bill for a build that is quietly broken. */
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = scratch
+
+  /* A channel that always fails, so the breaker can be driven without a real
+     outage, and one that always succeeds, so the digest and severity assertions
+     have something to compare against. */
+  let failNext = false
+  const sent = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), init })
+    return failNext ? { ok: false, status: 503 } : { ok: true, status: 200 }
+  }
+
+  const commands = []
+  const routes = []
+  const handlers = new Map()
+  const table = new Map()
+  const timers = []
+  const timer = {
+    timeout(callback, delay) {
+      timers.push({ callback, delay })
+      return () => {}
+    },
+    interval() {
+      return () => {}
+    },
+  }
+  const webServer = {
+    register(route) {
+      if (table.has(route.path)) throw new Error(`duplicate route: ${route.path}`)
+      table.set(route.path, route)
+      routes.push(route)
+      return () => {}
+    },
+  }
+  const webCtx = makeCtx(['webServer'], { webServer })
+  const ctx = makeCtx(variantMod.inject, {
+    commands: { register: (definition) => (commands.push(definition), () => {}) },
+    timer,
+    timeout: timer.timeout,
+    interval: timer.interval,
+  })
+  Object.defineProperty(ctx, 'on', { value: (event, handler) => (handlers.set(event, handler), () => {}), configurable: true })
+  Object.defineProperty(ctx, 'inject', { value: (s, cb) => (typeof cb === 'function' && cb(webCtx), () => {}), configurable: true })
+
+  const readOutbox = () => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(outboxPath, 'utf8'))
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+
+  try {
+    await variantMod.apply(ctx)
+    const configRoute = routes.find((route) => route.path === '/notify-relay/config')
+    if (!configRoute) return { booted: false }
+    const post = (config) => callRoute(configRoute, { method: 'POST', body: { config } })
+    const agentListener = handlers.get('agent/error')
+    const sessionListener = handlers.get('session/event')
+
+    /* ---- severity on the wire ---- */
+    await post({
+      enabled: true,
+      language: 'en',
+      events: { 'task.done': true, 'task.failed': true, 'request.failed': true, 'approval.asked': true },
+      dedup: { windowMinutes: 0 },
+      quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
+      digest: { enabled: false, intervalMinutes: 30 },
+      channels: [{ id: 'loud', kind: 'bark', secrets: { key: 'LOUD' }, enabled: true, events: ['*'] }],
+    })
+    sent.length = 0
+    if (sessionListener) {
+      await sessionListener({ id: 'sev-1' }, { type: 'approval/asked', data: { toolName: 'bash', reason: 'rm -rf' } })
+      await settle(250)
+    }
+    const approval = sent.find((entry) => entry.url.includes('api.day.app/LOUD'))
+    const severityDropped = !approval || (() => {
+      try {
+        const payload = JSON.parse(String(approval.init.body))
+        return payload.level !== 'critical' || payload.call !== '1'
+      } catch {
+        return true
+      }
+    })()
+
+    /* ---- the digest audience ----
+
+       A channel subscribing only to `task.failed` must receive a digest that
+       holds a `task.failed`. Regressing to `channelsFor(notification)` filters
+       it out, because the digest's own kind is `'digest'`. */
+    await post({
+      enabled: true,
+      language: 'en',
+      events: { 'task.done': true, 'task.failed': true, 'request.failed': true, 'approval.asked': true },
+      dedup: { windowMinutes: 0 },
+      quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
+      digest: { enabled: true, intervalMinutes: 30 },
+      channels: [{ id: 'tf', kind: 'bark', secrets: { key: 'TF' }, enabled: true, events: ['task.failed'] }],
+    })
+    sent.length = 0
+    if (agentListener) {
+      await agentListener({ sessionId: 'dig-1', title: 'dig-1', detail: 'x' })
+      await settle(200)
+    }
+    const flushRoute = routes.find((route) => route.path === '/notify-relay/flush')
+    if (flushRoute) await callRoute(flushRoute, { method: 'GET' })
+    await settle(250)
+    const digestRegressed = !sent.some((entry) => entry.url.includes('api.day.app/TF'))
+
+    /* ---- the breaker ----
+
+       Three distinct failures must open it, and a fourth notification must not
+       reach the network. Removing the breaker means the fourth call goes out. */
+    await post({
+      enabled: true,
+      language: 'en',
+      events: { 'task.done': true, 'task.failed': true, 'request.failed': true, 'approval.asked': true },
+      dedup: { windowMinutes: 0 },
+      quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
+      digest: { enabled: false, intervalMinutes: 30 },
+      channels: [{ id: 'bk', kind: 'bark', secrets: { key: 'BK' }, enabled: true, events: ['task.failed'] }],
+    })
+    failNext = true
+    sent.length = 0
+    if (agentListener) {
+      for (let i = 0; i < 3; i++) await agentListener({ sessionId: `bk-${i}`, title: `bk-${i}`, detail: 'nope' })
+      await settle(300)
+    }
+    const openAfterThree = (() => {
+      try {
+        return variantMod.breakerOpen('bk')
+      } catch {
+        return false
+      }
+    })()
+    sent.length = 0
+    if (agentListener) await agentListener({ sessionId: 'bk-after', title: 'bk-after', detail: 'again' })
+    await settle(300)
+    const breakerRemoved = !openAfterThree || sent.some((entry) => entry.url.includes('api.day.app/BK'))
+
+    /* ---- jitter ----
+
+       Two calls at the same attempt must be able to differ, and every draw must
+       stay inside the bounds. A build that returns the bare base passes the
+       bound test and fails the distinctness one. */
+    let jitterRemoved = false
+    try {
+      const draws = new Set([variantMod.backoffMs(3, () => 0), variantMod.backoffMs(3, () => 0.5), variantMod.backoffMs(3, () => 1)])
+      jitterRemoved = draws.size < 3
+    } catch {
+      jitterRemoved = true
+    }
+
+    /* ---- the heartbeat ----
+
+       Fire the armed timer and see whether it re-arms. Gating the re-arm on a
+       non-empty outbox leaves exactly one timer behind, which is the bug: a
+       healthy relay has an empty outbox by definition. */
+    let heartbeatGated = false
+    try {
+      const armed = timers.length
+      if (armed > 0) {
+        await timers[armed - 1].callback()
+        await settle(50)
+        heartbeatGated = timers.length <= armed
+      }
+    } catch {
+      heartbeatGated = true
+    }
+
+    /* ---- the degraded self-monitor ----
+
+       With the breaker open and a healthy channel available, the tick must
+       produce a `relay.degraded` notification. Removing the call from the timer
+       leaves `sent` empty. */
+    failNext = false
+    sent.length = 0
+    try {
+      const armed = timers.length
+      if (armed > 0) {
+        await timers[armed - 1].callback()
+        await settle(300)
+      }
+      const monitorRemoved = !sent.some((entry) => {
+        try {
+          return JSON.parse(String(entry.init.body)).group === 'notify-relay'
+        } catch {
+          return false
+        }
+      })
+      return {
+        booted: true,
+        severityDropped,
+        digestRegressed,
+        breakerRemoved,
+        jitterRemoved,
+        heartbeatGated,
+        monitorRemoved,
+        outbox: readOutbox().length,
+      }
+    } catch (error) {
+      return { booted: true, error: String(error && error.message) }
+    }
+  } finally {
+    globalThis.fetch = realFetch
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+}
+
+/**
  * Boots a variant plugin instance in isolation and drives ONE failing delivery
  * through it, then reports what landed on disk.
  *
@@ -1335,7 +1879,7 @@ async function testVariants(mod, originalSource) {
       label: 'the listener wrapper drops the second argument',
       mutate: (source) =>
         source.replace(
-          'ctx.on(event, (...args) => {\n        void Promise.resolve(handler(...args))',
+          /ctx\.on\(event, \(\.\.\.args\) => \{\r?\n        void Promise\.resolve\(handler\(\.\.\.args\)\)/,
           'ctx.on(event, (payload) => {\n        void Promise.resolve(handler(payload))',
         ),
       expect: ({ source }) => !/ctx\.on\(event, \(\.\.\.args\)/.test(source),
@@ -1372,7 +1916,11 @@ async function testVariants(mod, originalSource) {
          restart — the documented limitation of the incumbent notifier, and the
          reason this feature exists. */
       label: 'the outbox is not persisted',
-      mutate: (source) => source.replace('  outbox = outbox.slice(0, MAX_OUTBOX_ENTRIES)\n  await persistOutbox()\n}', '  outbox = outbox.slice(0, MAX_OUTBOX_ENTRIES)\n}'),
+      mutate: (source) =>
+        source.replace(
+          /  outbox = outbox\.slice\(0, MAX_OUTBOX_ENTRIES\)\r?\n  await persistOutbox\(\)\r?\n\}/,
+          '  outbox = outbox.slice(0, MAX_OUTBOX_ENTRIES)\n}',
+        ),
       probe: probeOutbox,
       expect: ({ probe }) => probe && probe.persisted === false,
     },
@@ -1389,8 +1937,88 @@ async function testVariants(mod, originalSource) {
       /* The retry route is the only user-facing handle on the outbox. Without
          it a failed delivery is invisible and unfixable from the UI. */
       label: 'the retry route removed',
-      mutate: (source) => source.replace(/  \/\* One route per path, method switched inside[\s\S]*?disposers\.push\(\n    registerRoute\(\n      webServer,\n      \{\n        kind: 'exact',\n        path: `\$\{ROUTE_PREFIX\}\/retry`,[\s\S]*?\},\n      log,\n    \),\n  \)\n/, ''),
+      mutate: (source) =>
+        source.replace(
+          /  \/\* One route per path, method switched inside[\s\S]*?disposers\.push\(\r?\n    registerRoute\(\r?\n      webServer,\r?\n      \{\r?\n        kind: 'exact',\r?\n        path: `\$\{ROUTE_PREFIX\}\/retry`,[\s\S]*?\},\r?\n      log,\r?\n    \),\r?\n  \)\r?\n/,
+          '',
+        ),
       expect: ({ routes }) => !routes.some((route) => route.path === '/notify-relay/retry'),
+    },
+
+    /* ---- v0.3.0 variants ----
+
+       Each one reproduces a real regression the feature is meant to prevent, and
+       each is caught by a behavioural assertion rather than a source-pattern
+       check: a variant that only removes a word still compiles and still
+       delivers, so only driving the plugin proves the feature is gone. */
+    {
+      /* Severity is the feature most likely to be dropped by accident, because
+         every payload still delivers without it. The `level` field on Bark is
+         the only primitive in this channel set that pierces iOS DND, so losing
+         the mapping silently costs the user the approval they were notified
+         about. */
+      label: 'the severity mapping dropped',
+      mutate: (source) =>
+        source.replace(
+          /const level = \{ critical: 'critical', high: 'timeSensitive', normal: 'active', low: 'passive' \}\[n\.severity\] \|\| 'active'/,
+          "const level = 'active'",
+        ),
+      probe: probeFeatures,
+      expect: ({ probe }) => probe && probe.severityDropped === true,
+    },
+    {
+      /* Without the breaker a hard-down channel is retried on every
+         notification, forever, and each retry costs a full timeout — so the
+         outbox grows and the healthy channels are delayed behind the dead one. */
+      label: 'the circuit breaker removed',
+      mutate: (source) =>
+        source.replace(
+          /  if \(breakerOpen\(channel\.id\)\) \{\r?\n    const entry = \{[\s\S]*?\r?\n    \}\r?\n    await recordDelivery\(entry\)\r?\n    return entry\r?\n  \}\r?\n/,
+          '',
+        ),
+      probe: probeFeatures,
+      expect: ({ probe }) => probe && probe.breakerRemoved === true,
+    },
+    {
+      /* Full-jitter or no-jitter: either way the retry times synchronise, and
+         the moment a shared channel recovers every queued item fires at once. */
+      label: 'the backoff jitter removed',
+      mutate: (source) => source.replace(/  return Math\.round\(base \* \(0\.75 \+ rand\(\) \* 0\.5\)\)/, '  return base'),
+      probe: probeFeatures,
+      expect: ({ probe }) => probe && probe.jitterRemoved === true,
+    },
+    {
+      /* The 0.2.0 digest bug: delivering with `kind: 'digest'` so every channel
+         that subscribes to a specific kind is filtered out of the digest and
+         silently receives nothing. */
+      label: 'the digest channel filter regressed',
+      mutate: (source) =>
+        source.replace(
+          /  const heldKinds = new Set\(items\.map\(\(item\) => item\.kind\)\)\r?\n  const targets = config\.channels\.filter\(\(channel\) => \{\r?\n    if \(!channel\.enabled\) return false\r?\n    if \(channel\.events\.includes\('\*'\)\) return true\r?\n    return channel\.events\.some\(\(kind\) => heldKinds\.has\(kind\)\)\r?\n  \}\)/,
+          '  const targets = channelsFor(notification)',
+        ),
+      probe: probeFeatures,
+      expect: ({ probe }) => probe && probe.digestRegressed === true,
+    },
+    {
+      /* A notifier that quietly stops notifying is strictly worse than no
+         notifier, because the user believes they are covered. This is the one
+         variant whose absence costs the user the most and whose presence is
+         invisible in normal operation. */
+      label: 'the degraded self-monitor removed',
+      mutate: (source) => source.replace(/      await drainOutbox\(\)\r?\n      await reportDegraded\(\)\r?\n/, '      await drainOutbox()\n'),
+      probe: probeFeatures,
+      expect: ({ probe }) => probe && probe.monitorRemoved === true,
+    },
+    {
+      /* A heartbeat that stops when the queue empties cannot detect the failure
+         it exists to catch — a relay that is enabled and quietly delivering
+         nothing has an empty queue by definition. */
+      label: 'the heartbeat re-arms only while work is pending',
+      mutate: (source) =>
+        source.replace(/      if \(config\.enabled\) armOutboxTimer\(delay\)/, '      if (outbox.length > 0) armOutboxTimer(delay)'),
+      probe: probeFeatures,
+      expect: ({ probe }) => probe && probe.heartbeatGated === true,
     },
   ]
 
@@ -1503,6 +2131,10 @@ async function main() {
   testFingerprint(mod)
   testQuietHours(mod)
   testBuildDelivery(mod)
+  testSeverity(mod)
+  testDeepLink(mod)
+  testBackoffJitter(mod)
+  testBreaker(mod)
   testRedaction(mod)
 
   console.log('\n== apply() contract ==')

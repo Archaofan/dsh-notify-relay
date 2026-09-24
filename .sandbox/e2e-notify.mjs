@@ -172,19 +172,39 @@ const section = await page.evaluate(() => {
     dedup: !!document.querySelector('[data-testid="relay-dedup"]'),
     quietStart: !!document.querySelector('[data-testid="relay-quiet-start"]'),
     digest: !!document.querySelector('[data-testid="relay-digest"]'),
+    /* v0.3.0 surfaces. */
+    language: !!document.querySelector('[data-testid="relay-language"]'),
+    retry: !!document.querySelector('[data-testid="relay-retry"]'),
+    deepLink: !!document.querySelector('[data-testid="relay-deeplink"]'),
   }
 })
 if (!section) {
   check(false, 'the settings section body rendered')
 } else {
   check(!!section.master, 'the section renders the master switch')
-  check(section.switches === 4, 'the section renders one switch per event', `${section.switches} switches`)
+  /* Eight, not four. The host's EVENT_KINDS grew from four to eight when the
+     turn-end reasons were split out, and the browser half's list did not move —
+     the settings page ended up with four switches for eight events, so four
+     kinds were silently unconfigurable. Each half was internally consistent, so
+     both harness gates stayed green; only a real browser, counting switches,
+     catches it. */
+  check(section.switches === 8, 'the section renders one switch per event', `${section.switches} switches`)
   check(section.kindSelects >= 0, 'the channel editor is present')
   check(section.save, 'the save button renders')
   check(section.addChannel, 'the add-channel button renders')
   check(section.dedup, 'the dedup window input renders')
   check(section.quietStart, 'the quiet-hours start input renders')
   check(section.digest, 'the digest switch renders')
+  check(section.language, 'the delivery-language select renders')
+  check(section.retry, 'the retry-now button renders')
+  check(section.deepLink, 'the deep-link input renders')
+  /* The retry button must be disabled with an empty outbox: "retry now" over
+     nothing is a button that does nothing and says it did. */
+  const retryDisabled = await page.evaluate(() => {
+    const node = document.querySelector('[data-testid="relay-retry"]')
+    return node ? node.disabled === true : null
+  })
+  check(retryDisabled === true, 'the retry button is disabled with an empty outbox', String(retryDisabled))
 }
 
 /* ------------------------------------------------------------------ *

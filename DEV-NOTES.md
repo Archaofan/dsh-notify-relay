@@ -244,6 +244,94 @@ limitation of the incumbent notifier in this ecosystem.
 ignoring the backoff, because "the log says failed — now what?" is the question
 the backoff does not answer.
 
+## v0.3.0 — severity, breakers, and the relay reporting on itself
+
+Three additions, each driven by the same observation: a notifier's job is not to
+deliver a message, it is to **not be silently wrong**.
+
+### Severity maps to real vendor fields
+
+`SEVERITY_BY_KIND` is the single source of truth, and every payload builder
+translates it into the channel's own primitive rather than a bespoke scheme:
+
+- Bark `level` — `critical | active | timeSensitive | passive` (API V2), with
+  `call: '1'` + `volume: '10'` reserved for `critical`.
+- ntfy `Priority` — 1–5.
+- Telegram `disable_notification` — Telegram only *downgrades*; there is no
+  upgrade path.
+- webhook — a plain JSON `severity` field, so a downstream consumer can route.
+
+Server酱, WeCom and Feishu have no severity primitive and are left alone. The
+temptation is to stuff `【紧急】` into the title, and that is worse than nothing:
+it is a lie the API does not support, and it trains the user to distrust the
+channel.
+
+The most important assertion in the host harness is the **negative** one: a
+`normal`-severity Bark payload must NOT carry `call`. A task-done that rang
+through Do Not Disturb is how a notifier gets uninstalled, and it is invisible in
+every other check because the payload still delivers.
+
+### The breaker is a network claim, not a durable one
+
+`breakers` is a module-level `Map`, deliberately not persisted. A breaker says
+"the network is broken *now*", and a restart is exactly when the network may have
+been fixed. Re-tripping after a restart costs three attempts — cheap. Trusting a
+stale `openUntil` across a restart could suppress a working channel for thirty
+minutes for no reason at all.
+
+The cooldown ladder (1m → 5m → 15m → 30m) is stored as a *step index*, not a
+duration, so the ladder can be re-tuned without invalidating anything. A success
+resets the index, so a flapping channel does not drift toward the ceiling.
+
+Malformed-channel errors (`buildDelivery` returning `{ error }`) do **not** trip
+the breaker. A typo'd token is a config bug, and hiding it behind a cooldown
+would make it look like a transient outage — the two are diagnosed completely
+differently.
+
+### The heartbeat is not a work queue
+
+The outbox timer re-arms whenever `config.enabled`, not while the outbox is
+non-empty. This is the one place where "clean up after yourself" is exactly
+wrong: a relay whose channels are all broken has an *empty* outbox (because a
+skipped channel is not queued), so a heartbeat gated on pending work never runs
+in the one situation it exists to detect.
+
+`reportDegraded` runs on the same tick, after the drain. Its conservatism is all
+deliberate: once per `DEGRADED_COOLDOWN_MS`, only through healthy channels,
+`retry: false` so it cannot join the outbox it describes, and never through
+`classify()` so the event switches cannot silence it.
+
+If every channel is open there is nobody to tell. The fallback is a log row,
+which is honest: at least it is visible to the one user who opens the panel.
+
+### The digest audience bug
+
+`flushDigest` used to call `deliver(notification)` with `kind: 'digest'`, so
+`channelsFor` filtered it against each channel's `events` and dropped it for
+every channel that subscribes to specific kinds. A channel configured
+`events: ['task.failed']` — the README's own example — received no digest at all,
+and nothing complained because a digest is *supposed* to be quiet.
+
+The fix computes the union of channels that wanted any held kind. The broken
+variant reproduces the original one-line form, and the probe drives a
+`task.failed`-only channel through a real flush.
+
+## What the gates do not cover
+
+- Real channel endpoints. Every delivery in the gates goes to a loopback server
+  on `127.0.0.1`. Bark, Telegram and friends are proven only as payload
+  builders. The `level` / `call` / `Priority` / `disable_notification` values are
+  asserted from the vendor docs, not from a live response.
+- The slash command's output rendering inside DSH's own composer.
+- Concurrent browser tabs. `GET /config` re-reads from disk on every call, so an
+  external edit is picked up on the next poll, but two tabs editing at once will
+  clobber each other.
+- A restart under load. The outbox's restart recovery is proven by booting a
+  second instance against the same home and reading the pending count back, not
+  by killing a live process mid-delivery.
+- Real iOS DND behaviour. That `level: 'critical'` + `call: '1'` breaks through
+  silent mode is what the Bark docs say; it is not verified on a device.
+
 ## Host-side copy
 
 The browser half has `ctx.locale` and follows the UI. The host has no such
@@ -273,15 +361,32 @@ keystroke: a masked secret must be able to round-trip unchanged, and the only
 way to tell "user did not touch this" from "user cleared this" is to compare
 against the stored mask at save time.
 
-## What the gates do not cover
+`emptyConfig()` must mirror the host's `EVENT_KINDS` exactly, because it seeds the
+editor draft: a kind present in `EVENT_IDS` but absent there renders a switch with
+an undefined `checked`. The client harness cross-checks the two lists
+element-for-element, in order, and switches locale both ways asserting every kind
+has a real label — that is what caught the four unconfigurable events in 0.2.0,
+where each half was internally consistent and both gates were green.
 
-- Real channel endpoints. Every delivery in the gates goes to a loopback server
-  on `127.0.0.1`. Bark, Telegram and friends are proven only as payload
-  builders.
-- The slash command's output rendering inside DSH's own composer.
-- Concurrent browser tabs. `GET /config` re-reads from disk on every call, so an
-  external edit is picked up on the next poll, but two tabs editing at once will
-  clobber each other.
-- A restart under load. The outbox's restart recovery is proven by booting a
-  second instance against the same home and reading the pending count back, not
-  by killing a live process mid-delivery.
+## Not built in v0.3.0, and why
+
+Research surfaced more candidates than the budget allowed. These were deferred
+deliberately rather than forgotten:
+
+- **Content-based routing** (regex include/exclude per channel). Valuable, but it
+  turns the channel editor into a DSL and the rule center into a query language.
+  The per-channel `events` filter covers the common case.
+- **Focus gating** ("only notify when away"). Needs an idle signal DSH does not
+  expose to a plugin.
+- **A desktop/sound channel.** Browser-only, non-push, and the incumbent's
+  coverage there is already good.
+- **One-tap approve.** The interesting version needs a DSH-side endpoint that can
+  answer `approval/request` with a signature, and `ctx.waterfall` dispatches on the
+  *user-approval service's own* Context — a root-level plugin cannot register an
+  answerer at all. The deep link is the honest 80%: it opens the session, it does
+  not pretend to act for you.
+
+The thesis that survived all three research reports: **the decision layer is the
+product, not the channel list.** Seven channels that are reliably filtered,
+correctly prioritised and honestly self-reporting beat twenty-seven that fire
+everything at everyone.
