@@ -123,7 +123,59 @@ check(
 )
 
 /* ------------------------------------------------------------------ *
- * 2. the sidebar pill — what users see without opening settings
+ * 2. dismiss the first-run onboarding, if the GUI is showing it
+ * ------------------------------------------------------------------ */
+
+/**
+ * DSH 0.1.7 added a first-run flow that did not exist in 0.1.6: a closed-beta
+ * announcement followed by an "add an API key" prompt. Both render as a modal
+ * with a full-page mask that intercepts pointer events, so nothing in the
+ * sidebar can be clicked until they are gone.
+ *
+ * The API-key prompt is the one that matters. It is NOT persisted as "skipped"
+ * -- a profile with no credentials sees it again on every page load, so this
+ * runs after the GUI has settled rather than once. A profile that already has
+ * credentials never sees it, which is why the whole thing is conditional: the
+ * same code is a no-op on 0.1.6 and on an onboarded profile, so one e2e drives
+ * both sandboxes.
+ *
+ * The exact-text match is load-bearing. `hasText: '继续'` also matches
+ * "保存并继续", whose button is disabled until a key is typed, and clicking a
+ * disabled button times out with a log that says nothing about why.
+ */
+async function dismissFirstRun() {
+  for (let round = 0; round < 6; round += 1) {
+    const dialog = page.locator('[role="dialog"]').first()
+    if ((await dialog.count()) === 0) return true
+    const enabled = await page.evaluate(() => {
+      const node = document.querySelector('[role="dialog"]')
+      if (!node) return []
+      return [...node.querySelectorAll('button')]
+        .filter((b) => !b.disabled && (b.textContent || '').trim())
+        .map((b) => (b.textContent || '').trim())
+    })
+    if (enabled.length === 0) return false
+    /* The dismiss action is the last enabled button: 继续 on the announcement,
+       稍后配置 on the API-key prompt. Taking the last one rather than the first
+       avoids "保存并继续", which is enabled only after a key is entered. */
+    await page
+      .getByRole('button', { name: enabled[enabled.length - 1], exact: true })
+      .first()
+      .click({ timeout: 8000 })
+    await page.waitForTimeout(1500)
+  }
+  return (await page.locator('[role="dialog"]').count()) === 0
+}
+
+const onboardingClear = await dismissFirstRun()
+check(
+  onboardingClear,
+  'the first-run onboarding is dismissed',
+  'a modal is still covering the page, so the sidebar cannot be clicked',
+)
+
+/* ------------------------------------------------------------------ *
+ * 3. the sidebar pill — what users see without opening settings
  * ------------------------------------------------------------------ */
 console.log('— sidebar pill —')
 const pill = page.locator('[data-testid="relay-footer"]').first()

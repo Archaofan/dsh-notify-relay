@@ -63,12 +63,16 @@ DSH 自己的语言设置；**推送到你手机上的文案语言单独可设**
 
 ## 安装
 
+已在 **DSH 0.1.6-alpha.2 与 0.1.7-rc.2 两条线上实测通过**。两条线上的插件代码完全
+相同：运行时不做任何版本门禁，0.1.7 唯一发现的差异是首次运行引导（一个会拦掉所有
+点击的整页遮罩），那影响的是**测试脚本**而不是插件本身。
+
 ```bash
 # 生产 profile
 dsh plugin --profile web add github:Archaofan/dsh-notify-relay --ignore-scripts
 
 # 或本地目录 / tarball
-dsh plugin --profile web add file:./dsh-notify-relay-0.2.0.tgz --ignore-scripts
+dsh plugin --profile web add file:./dsh-notify-relay-0.3.1.tgz --ignore-scripts
 ```
 
 `--ignore-scripts` 是必要的：本插件没有安装脚本，也没有运行时依赖，拒绝执行它们

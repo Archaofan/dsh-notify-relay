@@ -70,12 +70,17 @@ known kind are kept — dropping them would silently destroy credentials.
 
 ## Install
 
+Verified against **DSH 0.1.6-alpha.2 and 0.1.7-rc.2**. The plugin code is
+identical across both: nothing is version-gated at runtime, and the only 0.1.7
+difference found was the first-run onboarding (a full-page mask that intercepts
+every click), which affects the *test harness* rather than the plugin.
+
 ```bash
 # production profile
 dsh plugin --profile web add github:Archaofan/dsh-notify-relay --ignore-scripts
 
 # or from a local checkout / tarball
-dsh plugin --profile web add file:./dsh-notify-relay-0.2.0.tgz --ignore-scripts
+dsh plugin --profile web add file:./dsh-notify-relay-0.3.1.tgz --ignore-scripts
 ```
 
 `--ignore-scripts` matters: the plugin has no install scripts and no runtime
