@@ -234,6 +234,21 @@ step('our entry survives into the built plugins.json', () => {
   if (!hit.tarball || !/releases\/download\/v0\.3\.2\//.test(hit.tarball)) {
     return { ok: false, detail: `unexpected tarball: ${hit.tarball}` }
   }
+  /* The install command is what a user copies. build-site.mjs folds it as
+   *   install: e.npm ? `... add ${e.npm}` : (e.cmdTarball ?? e.cmdGit)
+   * We are not on npm, so it must be the tarball command. If the tarball ever
+   * failed to survive into tarballMap it would silently fall back to
+   * `github:owner/repo` -- which installs from source, a different artifact
+   * from the one the listing promises. */
+  if (hit.npm !== null && hit.npm !== undefined) {
+    return { ok: false, detail: `expected npm null (we are not published), got ${hit.npm}` }
+  }
+  if (typeof hit.install !== 'string' || !/releases\/download\/v0\.3\.2\//.test(hit.install)) {
+    return { ok: false, detail: `install command is not the tarball command: ${hit.install}` }
+  }
+  if (!/^dsh plugin --profile web add "https:\/\/github\.com\/Archaofan\/dsh-notify-relay\/releases\/download\/.+\.tgz"$/.test(hit.install)) {
+    return { ok: false, detail: `install command is malformed: ${hit.install}` }
+  }
   return { ok: true }
 })
 
