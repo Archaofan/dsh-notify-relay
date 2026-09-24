@@ -186,7 +186,22 @@ try {
   # repository, so whatever email is configured here becomes public with it.
   $email = "$login@users.noreply.github.com"
   & git -c user.name=$login -c user.email=$email commit -q -m 'Add dsh-notify-relay to Notifications and Integrations'
-  & git push -q fork $Branch
+
+  # --force, and here is why it is safe. The branch is rebuilt from upstream
+  # main on every run, so a second run -- a retry after a failure, or this
+  # script having already been dry-run -- produces a commit that is NOT a
+  # descendant of what is already on the fork. A plain push is then rejected:
+  #   ! [rejected] add-dsh-notify-relay -> add-dsh-notify-relay (fetch first)
+  # Reproduced by running the submission path twice.
+  #
+  # --force-with-lease does not fix it either: the scratch clone is
+  # `--depth 1 --branch main` with the fork remote added seconds earlier, so
+  # there is no remote-tracking ref to lease against and git answers
+  # "(stale info)". Fetching first would work but buys nothing -- the lease
+  # protects a branch whose history matters, and this one is a script-owned
+  # artifact whose entire content is "upstream main plus one added file",
+  # regenerated from scratch every run. Declaring that is what --force means.
+  & git push -q --force fork $Branch
   Write-Host '  ok   branch pushed'
 
   Step 'the pull request'
