@@ -76,6 +76,17 @@ function placementVerdict() {
   return { ok: true, detail: added[0].trim() }
 }
 
+/* contributing.md: at most 3 entries per PR, checked before anything is
+ * fetched. Our PR adds one; the point of the negative test is that the bar is
+ * real, so seed four and confirm it trips. */
+function countVerdict() {
+  const r = g(['diff', '--name-only', '--diff-filter=A', `${baseRef}...HEAD`, '--', 'data/plugins'])
+  if (!r.ok) return { ok: false, detail: 'diff failed' }
+  const added = r.out.split('\n').filter((l) => l.trim())
+  if (added.length > 3) return { ok: false, detail: `adds ${added.length} entries; CI rejects above 3` }
+  return { ok: true, detail: `${added.length} added` }
+}
+
 /* Put the clone back to pristine upstream main. */
 function restore() {
   g(['reset', '-q', '--hard', baseRef])
@@ -145,7 +156,20 @@ const s4 = placementVerdict()
 expect('placement check REJECTS a file one level too shallow', !s4.ok && /misplaced/.test(s4.detail || ''), s4.detail)
 restore()
 
-/* 5. A branch that adds nothing at all -- the "merging lists nothing" case. */
+/* 5. Four entries in one PR -- CI rejects above three, before anything is
+ *    fetched. */
+seedEntry()
+const others = fs.readdirSync(path.join(REGISTRY, 'data', 'plugins'))
+  .filter((f) => f.endsWith('.yml') && f !== ENTRY_NAME)
+  .slice(0, 3)
+for (const o of others) fs.copyFileSync(path.join(REGISTRY, 'data', 'plugins', o), path.join(REGISTRY, 'data', 'plugins', 'zz-extra-' + o))
+g(['add', '-A'])
+g(['commit', '-q', '-m', 'four entries in one PR'])
+const s6 = countVerdict()
+expect('count check REJECTS four entries in one PR', !s6.ok && /adds \d+ entries/.test(s6.detail || ''), s6.detail)
+restore()
+
+/* 6. A branch that adds nothing at all -- the "merging lists nothing" case. */
 seedEntry()
 fs.rmSync(ENTRY_PATH)
 g(['add', '-A'])

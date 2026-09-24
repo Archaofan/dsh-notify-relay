@@ -62,7 +62,25 @@ step('entry yml parses and declares only allowed keys', () => {
   const needed = ['url', 'name', 'category', 'description', 'tarball']
   const missing = needed.filter((k) => !keys.includes(k))
   if (missing.length) return { ok: false, detail: `missing keys: ${missing.join(', ')}` }
+  /* contributing.md: "there is no field to add to your entry, and a hand-written
+   * `npm:` key in your yml is rejected." The npm mapping is picked up
+   * automatically from the registry's probe, so declaring it by hand is not
+   * merely redundant -- CI refuses it. */
+  if (/^\s*npm\s*:/m.test(raw)) return { ok: false, detail: 'a hand-written npm: key is rejected' }
   return { ok: true }
+})
+
+/* contributing.md: "A pull request may add at most 3 entries. Over that, CI
+ * rejects it and asks you to split." We add exactly one, but the bar is checked
+ * first in CI -- before anything is fetched -- so it belongs here too, and a
+ * future run that accidentally seeds extra entries must not sail past it. */
+step('the PR adds at most 3 entries', () => {
+  const g = (args) => sh('git', ['-C', REGISTRY, ...args])
+  const r = g(['diff', '--name-only', '--diff-filter=A', 'origin/main...HEAD', '--', 'data/plugins'])
+  if (!r.ok) return { ok: false, detail: 'diff failed' }
+  const added = r.out.split('\n').filter((l) => l.trim())
+  if (added.length > 3) return { ok: false, detail: `adds ${added.length} entries; CI rejects above 3` }
+  return { ok: true, detail: `${added.length} added` }
 })
 
 /* The build derives the added-date from the entry file's own first commit, so
