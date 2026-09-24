@@ -21,3 +21,5 @@ node_modules/
 .sandbox/_head.tmp
 .sandbox/_tail.tmp
 .sandbox/release-notes.md
+
+.sandbox/commit-msg.txt
