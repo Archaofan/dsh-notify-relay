@@ -1,11 +1,12 @@
 # dsh-notify-relay（通知中继）
 
-DSH 的外联**规则中枢**：任务完成、任务失败、请求失败、待审批这几类生命周期事件，
-先过去重、免打扰、摘要合批三道关，再发到 Bark、Server酱、Telegram、企业微信、
-飞书、ntfy 或任意 webhook。
+DSH 的外联**规则中枢**：任务完成、任务失败、任务中止、任务受阻、请求失败、待审批、
+审批已决、工具失败这几类生命周期事件，先过去重、免打扰、摘要合批三道关，再发到
+Bark、Server酱、Telegram、企业微信、飞书、ntfy 或任意 webhook。投递失败自动重试，
+重启不丢。
 
 零运行时依赖、无构建步骤，两个源文件（host 面 + 浏览器面）。中英双语，界面跟随
-DSH 自己的语言设置。
+DSH 自己的语言设置；**推送到你手机上的文案语言单独可设**。
 
 [English](README.md)
 
@@ -20,6 +21,8 @@ DSH 自己的语言设置。
 | **免打扰** | 凌晨两点半构建挂了。支持跨零点（`22:00 → 08:00`）；窗口内的重复要么丢弃，要么留给下次摘要 |
 | **摘要合批** | 二十个失败推二十条。被挂起的通知攒成一条，每 N 分钟发一次，也可手动立即发送 |
 | **静音** | 手头正忙时 `/notify mute 60`。压掉一切，连新指纹也压 |
+| **待审批穿透** | 免打扰和摘要**不拦**待审批。压住它到早上八点，等于让任务停摆到早上八点，而用户只会怪插件 |
+| **失败重试** | 通道临时挂了。失败的投递进持久化 outbox，按 30s→1m→2m→…→30min 指数退避重试，重启后接着试 |
 | **分流** | 每个通道独立的事件过滤：失败才发 Telegram，全部发 Bark |
 | **脱敏** | token 落在日志文件里。密钥在所有 API 响应里都以 `••••••••` 占位，投递日志中绝不出现 |
 
@@ -30,10 +33,14 @@ DSH 自己的语言设置。
 
 | 位置 | 内容 |
 | --- | --- |
-| **官方设置页** | 设置导航 → **外联中枢**：总开关、四个事件开关、去重窗口、免打扰（起 / 止 / 模式）、摘要间隔、通道编辑器 |
+| **官方设置页** | 设置导航 → **外联中枢**：总开关、八个事件开关、去重窗口、免打扰（起 / 止 / 模式）、摘要间隔、外发语言、待重试队列、通道编辑器 |
 | **通道编辑器** | 增删改通道；每个通道可设名称、类型、地址、密钥、事件过滤，并有**测试**按钮，立刻真实投递一次 |
 | **侧边栏底部** | 状态胶囊——开关态、最近一次投递结果，侧边栏收起时自动切紧凑形态；点开是最近的投递记录 |
-| **斜杠命令** | `/notify status`、`/notify test [通道]`、`/notify mute <分钟>`、`/notify unmute`、`/notify flush`，不经过模型 |
+| **斜杠命令** | `/notify status`、`/notify test [通道]`、`/notify mute <分钟>`、`/notify unmute`、`/notify flush`、`/notify retry`，不经过模型 |
+
+投递日志里**未投递的行也会出现**，并写明原因（去重 / 静音 / 免打扰挂起 / 摘要挂起 /
+无可用通道）。"到底发没发"是这个生态里被抱怨得最多的问题，而一份只记录成功发送的日志
+恰恰答不了它——因为有意思的那一行正是缺失的那一行。
 
 通道编辑器里的密钥显示为掩码，只有你真的改动了它才会回传给 host——所以打开编辑器
 直接按保存，不会把没动过的 token 清空。
@@ -61,7 +68,7 @@ DSH 自己的语言设置。
 dsh plugin --profile web add github:Archaofan/dsh-notify-relay --ignore-scripts
 
 # 或本地目录 / tarball
-dsh plugin --profile web add file:./dsh-notify-relay-0.1.0.tgz --ignore-scripts
+dsh plugin --profile web add file:./dsh-notify-relay-0.2.0.tgz --ignore-scripts
 ```
 
 `--ignore-scripts` 是必要的：本插件没有安装脚本，也没有运行时依赖，拒绝执行它们
@@ -78,7 +85,17 @@ dsh plugin --profile web add file:./dsh-notify-relay-0.1.0.tgz --ignore-scripts
 ```json
 {
   "enabled": true,
-  "events": { "task.done": false, "task.failed": true, "request.failed": true, "approval.asked": true },
+  "language": "zh",
+  "events": {
+    "task.done": false,
+    "task.failed": true,
+    "task.aborted": true,
+    "task.blocked": true,
+    "request.failed": true,
+    "approval.asked": true,
+    "approval.decided": false,
+    "tool.failed": true
+  },
   "dedup": { "windowMinutes": 10 },
   "quiet": { "enabled": false, "start": "22:00", "end": "08:00", "mode": "digest" },
   "digest": { "enabled": false, "intervalMinutes": 30 },
@@ -96,6 +113,34 @@ dsh plugin --profile web add file:./dsh-notify-relay-0.1.0.tgz --ignore-scripts
 ```
 
 `mode` 为 `digest`（挂起重复，合成一条发送）或 `drop`（直接丢弃）。
+
+`language` 是**外发语言**（`zh` / `en`），决定推送到你手机上的文案、`/notify` 的回复
+和摘要标题。界面语言仍跟随 DSH 自己的设置——两者是独立的，因为读界面的你和在凌晨两点
+读到推送的可能不是同一个人。取值不合法时回落到 `zh`。
+
+## 事件从哪来
+
+八类事件，两种到达方式，区别不是装饰：
+
+| 事件 | 来源 | 默认 |
+| --- | --- | --- |
+| `task.done` | `turn/end`，`reason.kind = completed` | 关 |
+| `task.failed` | `agent/error` | 开 |
+| `task.aborted` | `turn/end`，`reason.kind = aborted` | 开 |
+| `task.blocked` | `turn/end`，`reason.kind = blocked` | 开 |
+| `request.failed` | `agent/request-error` | 开 |
+| `approval.asked` | `approval/asked` | 开，**穿透免打扰与摘要** |
+| `approval.decided` | `approval/decided` | 关 |
+| `tool.failed` | `tool/result`，且 `data.error` 是对象 | 开 |
+
+`turn/end` 会带一个 `reason`（`completed` / `aborted` / `blocked` / `error` /
+`max-tokens` / `interrupted`），所以"任务完成"和"任务被中止"是两条不同的通知，而不是
+把所有结束都报成完成。
+
+会话类事件（`turn/*`、`approval/*`、`tool/result`）在整个 DSH 里**只以 `session/event`
+一个名字分发一次**，载荷是 `(session, event)`，真实名字在 `event.type` 里。监听
+`ctx.on('turn/end')` 等于监听一个 DSH 从不分发的事件——这正是第一版静默死掉的半边事件
+覆盖，也是 harness 里那个"监听器注册在会话子事件名上"坏变体的由来。
 
 ## 规则引擎怎么判
 
@@ -121,9 +166,9 @@ send         立即投递
 
 | 门禁 | 证明了什么 |
 | --- | --- |
-| `.sandbox/host-harness.cjs` | fail-loud 的 inject 契约、规则引擎（去重 / 免打扰 / payload 构造 / 脱敏）、**一次打到回环服务器的真实 HTTP 投递**、6 个坏构建变体 |
-| `.sandbox/client-harness.cjs` | 在严格假 ctx 下物化、inject 契约、设置页导航标签随语言切换、字典键对齐、编辑器完整往返、4 个坏变体 |
-| `.sandbox/live-check.cjs` | 插件**在真实 DSH 里启动**：写配置 → 读回 → 真实 socket 投递 → 日志 → 复位 |
+| `.sandbox/host-harness.cjs` | fail-loud 的 inject 契约、规则引擎（去重 / 免打扰 / payload 构造 / 脱敏）、**一次打到回环服务器的真实 HTTP 投递**、持久化 outbox 的入队 / 退避 / 重试 / 放弃 / 重启恢复，10 个坏构建变体 |
+| `.sandbox/client-harness.cjs` | 在严格假 ctx 下物化、inject 契约、设置页导航标签随语言切换、字典键对齐、编辑器完整往返、**事件词表与 host 逐项对齐**，4 个坏变体 |
+| `.sandbox/live-check.cjs` | 插件**在真实 DSH 里启动**：写配置 → 读回 → 真实 socket 投递 → 日志 → 复位 → `/retry` → 外发语言 |
 | `.sandbox/e2e-notify.mjs` | 浏览器面在**真实 GUI** 里：状态胶囊、投递面板、官方设置分区、以及一次从界面穿透到 host 的修改 |
 
 ```bash
@@ -132,7 +177,7 @@ node .sandbox/gate.cjs        # 两个 harness，两种语言，外加全部变�
 
 两个 harness 都按语言各跑一遍——只在中文下能物化的构建，证明不了英文界面任何事。
 
-### 两个只有"会失败的门禁"才抓到的 bug
+### 只有"会失败的门禁"才抓到的 bug
 
 **一个从未执行过的 POST 路由。** 第一版把 `GET /config` 和 `POST /config` 写成两条
 路由。`webServer.match()` 按路径查表、**完全忽略 method**，于是第二次注册抛错，重复
@@ -147,7 +192,34 @@ harness 的假 webServer 现在与真实实现逐字一致（按路径建 Map、
 返回 500。直到 `live-check.cjs` 真的调了这个路由才发现。参数已经去掉，harness 现在
 也会真的调用路由，而不只是断言它存在。
 
-两件事都记在 [DEV-NOTES.md](DEV-NOTES.md) 里，附确切症状，下一个人不必重新踩。
+**半个事件覆盖是死的。** 第一版同时注册了 `ctx.on('turn/end')` 和
+`ctx.on('approval/asked')`。这两个事件从不以这些名字分发——会话事件只在
+`session/event` 下出现一次——所以两个监听器从未执行，"任务完成"和"待审批"两类通知
+一条都没发过。改成 `session/event` + 内层 `event.type` 分支。harness 现在维护一份
+`DISPATCHED_EVENT_NAMES` 注册表，断言每个监听器名字都在表内、`HOST_EVENT_NAMES` 与真实
+注册一致、没有监听器落在会话子事件名上；两个坏变体分别复现"死监听器"和"包装器吞掉第二
+个参数"两种形态。
+
+**mixiin 服务的方法在 ctx 上，不在服务上。** `@cordisjs/plugin-timer` 用
+`ctx.mixin('timer', [...])` 把方法直接挂到 context 上，所以 `hostCtx.timeout(...)` 是
+对的。第一版 harness 只提供了 `ctx.timer.timeout`，fail-loud 代理理所当然地拒绝了
+`ctx.timeout`——但 digest 路径从未带着排队项被走到过，于是这道门在一片从未执行的代码
+上亮着绿灯。现在假 ctx 同时提供两个面，并且在 mixin 服务本身被声明时允许它的方法名。
+
+**事件词表两边各一份，然后漂移了。** 浏览器面拿不到 host 的 `EVENT_KINDS`，只能自己
+维护一份。turn-end 的 reason 被拆开之后 host 那边从四类长到八类，浏览器这份没动——设置页
+出现四个开关管八个事件，四类事件静默不可配置，而两边各自都是自洽的，所以两道门全是绿的。
+只有真实浏览器里数了一遍开关才发现。现在 client harness 直接 import host 的
+`EVENT_KINDS`，逐项、按顺序比对两份列表，并切换语言两个方向确认每类事件在两个字典里都有
+标签。
+
+**outbox 探针读错了 home。** 变体运行器在自己的 `finally` 里恢复 `DSH_HOME`，而行为探针
+跑在它之后——被改坏的插件每一次写入都落在真实用户目录，探针读的却是一个空的临时目录，
+于是对一个 outbox 完全正常的构建报告"没有 outbox"，给一个从未被真正观察到的回归放了绿
+灯。现在探针自己把 `DSH_HOME` 指回去，并且在得出结论前先断言配置写入和 outbox 文件都确
+实落地。
+
+全部十处都记在 [DEV-NOTES.md](DEV-NOTES.md) 里，附确切症状，下一个人不必重新踩。
 
 ## 卸载
 

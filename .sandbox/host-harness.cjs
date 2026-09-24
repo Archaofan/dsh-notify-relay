@@ -102,7 +102,19 @@ const CORDIS_BUILTINS = [
  * @param {object} services service name -> fake implementation
  */
 function makeCtx(injectList, services) {
+  /* A mixin service installs its own methods on the context, so they are
+     reachable WITHOUT being named in `inject`. `@cordisjs/plugin-timer` does
+     exactly this (`ctx.mixin('timer', [...])`), which is why the plugin writes
+     `ctx.timeout(...)` and why the fail-loud proxy must allow those names
+     whenever the service itself is declared. Without this the proxy reports a
+     contract violation that does not exist in production. */
+  const MIXIN_SURFACE = {
+    timer: ['timeout', 'interval', 'throttle', 'debounce', 'setTimeout', 'setInterval'],
+  }
   const allowed = new Set([...CORDIS_BUILTINS, ...injectList])
+  for (const [service, methods] of Object.entries(MIXIN_SURFACE)) {
+    if (injectList.includes(service)) for (const method of methods) allowed.add(method)
+  }
   const reads = []
 
   const base = {
@@ -115,7 +127,14 @@ function makeCtx(injectList, services) {
       return () => {}
     },
     logger() {
-      return { info() {}, warn() {}, error() {}, debug() {} }
+      const noop = () => {}
+      if (!process.env.NOTIFY_DEBUG) return { info: noop, warn: noop, error: noop, debug: noop }
+      return {
+        info: noop,
+        warn: (message) => console.log('  [dbg] warn:', String(message)),
+        error: (message) => console.log('  [dbg] error:', String(message)),
+        debug: noop,
+      }
     },
     inject(services_, callback) {
       /* Opportunistic wait: the real ctx.inject runs the callback only once
@@ -359,6 +378,23 @@ async function testApply(mod) {
     },
   }
 
+  /* `@cordisjs/plugin-timer` is a MIXIN: `ctx.mixin('timer', ['timeout',
+     'interval', ...])` (cordis-plugin-timer/src/index.ts:15) puts the methods
+     directly on the context, so the plugin correctly writes `ctx.timeout(...)`.
+     The first cut of this harness only offered `ctx.timer.timeout`, and the
+     fail-loud proxy rightly refused `ctx.timeout` — but the digest path was
+     never reached with a queued item, so the mismatch stayed latent and the
+     gate stayed green. Both surfaces are provided now. */
+  const timerService = {
+    timeout(callback, delay) {
+      timers.push({ callback, delay })
+      return () => {}
+    },
+    interval(callback, delay) {
+      timers.push({ callback, delay, interval: true })
+      return () => {}
+    },
+  }
   const services = {
     commands: {
       register(definition) {
@@ -366,16 +402,9 @@ async function testApply(mod) {
         return () => {}
       },
     },
-    timer: {
-      timeout(callback, delay) {
-        timers.push({ callback, delay })
-        return () => {}
-      },
-      interval(callback, delay) {
-        timers.push({ callback, delay, interval: true })
-        return () => {}
-      },
-    },
+    timer: timerService,
+    timeout: timerService.timeout,
+    interval: timerService.interval,
   }
 
   const ctx = makeCtx(mod.inject, services)
@@ -394,6 +423,11 @@ async function testApply(mod) {
   Object.defineProperty(ctx, 'on', {
     value(event, handler) {
       eventHandlers.set(event, handler)
+      /* The outbox test needs the real `session/event` listener, and this
+         closure is the only place that sees it. Capture it rather than
+         re-implementing the dispatch — the whole point of the harness is to
+         drive the plugin's own code path. */
+      if (event === 'session/event') currentSessionListener = handler
       serviceReads.push(`on:${event}`)
       return () => eventHandlers.delete(event)
     },
@@ -401,15 +435,31 @@ async function testApply(mod) {
   })
 
   /* The plugin's apply() is async and touches DSH_HOME; the harness points
-     that at a scratch directory so nothing real is read or written. */
+     that at a scratch directory so nothing real is read or written. The
+     scratch home stays installed for the WHOLE test, not just apply(): every
+     handler driven below writes the delivery log, and that must not land in
+     the developer's real ~/.dsh. */
   const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-notify-harness-'))
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = scratch
-  try {
-    await mod.apply(ctx)
-  } finally {
+  const readDeliveries = async () => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(scratch, 'storages', 'notify-relay', 'deliveries.json'), 'utf8'))
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+  const restoreHome = () => {
     if (previousHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previousHome
+  }
+
+  try {
+    await mod.apply(ctx)
+  } catch (error) {
+    restoreHome()
+    throw error
   }
 
   /* ---- the contract itself ---- */
@@ -431,13 +481,58 @@ async function testApply(mod) {
     check('command exposes a hint', !!(command.input && command.input.hint))
   }
 
-  const expectedEvents = ['turn/end', 'agent/error', 'agent/request-error', 'approval/asked']
+  /* ---- event listeners ----
+
+     This is the check that catches the bug 0.1.0 actually shipped. Session
+     events (turn/step/message/tool/approval) are dispatched ONCE, under the
+     single name `session/event`, as `(session, event)` — there is no re-emit
+     under the individual name. So `ctx.on('turn/end')` and
+     `ctx.on('approval/asked')` are listeners on events that never fire, and
+     half the notification coverage is silently dead.
+
+     A fake ctx that records whatever name you hand it cannot see that. So the
+     registry below is transcribed from the real dispatch sites:
+       - `dsh-session/lib/types/index.js:600` dispatches 'session/event'
+       - `dsh-agent/lib/types/runtime-types.d.ts:227-402` lists the global
+         agent/* names (created/disposed/status/pre-step/request/request-error/
+         assistant-stream/turn-stopping/error)
+     Every name the plugin registers must appear here, and the plugin's own
+     declared HOST_EVENT_NAMES must match what it registers. */
+  const DISPATCHED_EVENT_NAMES = new Set([
+    'session/event',
+    'session/created',
+    'session/disposed',
+    'session/flush',
+    'agent/created',
+    'agent/disposed',
+    'agent/status',
+    'agent/pre-step',
+    'agent/request',
+    'agent/request-error',
+    'agent/assistant-stream',
+    'agent/turn-stopping',
+    'agent/error',
+    'approval/request',
+    'tools/change',
+    'loader/config-update',
+    'internal/plugin',
+    'internal/status',
+    'internal/dispatch',
+  ])
+
+  const expectedEvents = ['agent/error', 'agent/request-error', 'session/event']
   for (const event of expectedEvents) {
     check(`listens to ${event}`, eventHandlers.has(event))
   }
   check('no unexpected listeners', eventHandlers.size === expectedEvents.length, [...eventHandlers.keys()].join(','))
+  for (const name of eventHandlers.keys()) {
+    check(`"${name}" is an event DSH actually dispatches`, DISPATCHED_EVENT_NAMES.has(name), 'not in the dispatch registry')
+  }
+  const declaredNames = Array.isArray(mod.HOST_EVENT_NAMES) ? mod.HOST_EVENT_NAMES : []
+  check('HOST_EVENT_NAMES matches the real listeners', declaredNames.length === eventHandlers.size && declaredNames.every((n) => eventHandlers.has(n)), declaredNames.join(','))
+  check('no listener on a session-event sub-name', !['turn/end', 'approval/asked', 'approval/decided', 'tool/result', 'turn/start'].some((n) => eventHandlers.has(n)), [...eventHandlers.keys()].join(','))
 
-  const expectedPaths = ['/notify-relay/config', '/notify-relay/log', '/notify-relay/test', '/notify-relay/flush']
+  const expectedPaths = ['/notify-relay/config', '/notify-relay/log', '/notify-relay/test', '/notify-relay/flush', '/notify-relay/retry']
   for (const expected of expectedPaths) {
     check(`route ${expected} registered`, routes.some((route) => route.path === expected))
   }
@@ -459,16 +554,142 @@ async function testApply(mod) {
   /* ---- the digest timer is armed through the official timer service ---- */
   check('no timer armed before any event', timers.length === 0)
 
-  /* ---- slash command behaviour ---- */
+  /* Declared here because the dispatch block below needs it to clear the mute
+     that `/notify mute 30` leaves set — a muted relay logs nothing, so every
+     assertion below would come back "muted" instead of the real verdict. */
   const invocation = { commandId: 'cmd-test', rawInput: '', attachments: [], signal: new AbortController().signal }
+
+  const allEvents = {}
+  for (const kind of mod.EVENT_KINDS) allEvents[kind.id] = true
+
+  /* ---- session/event dispatch ----
+
+     Driving the real handler with synthetic `(session, event)` pairs is the
+     only way to prove the mapping works: `turn/end` reason=aborted must become
+     `task.aborted`, not `task.done`. 0.1.0 reported every turn end as "done",
+     which told the user a cancelled turn had succeeded.
+
+     This sits after the command gate because it needs `invocation` — and
+     because the mute test above leaves the relay muted, which would make every
+     verdict below come back "muted" and log nothing. */
+  const sessionHandler = eventHandlers.get('session/event')
+  check('session/event handler exists', typeof sessionHandler === 'function')
+  if (typeof sessionHandler === 'function') {
+    await command.handler({ ...invocation, rawInput: 'unmute' })
+
+    /* A channel is needed for anything to be logged: `recordDelivery` runs once
+       per channel, so an empty config produces no rows at all. Configured
+       through the plugin's own POST route — the same path the browser takes.
+       Every event kind is switched on explicitly: this block is about DISPATCH,
+       and `task.done` / `approval.decided` are off by default because a
+       completed turn is routine. The defaults themselves are asserted above. */
+    const dead = await callRouteByPath(routes, '/notify-relay/config', {
+      method: 'POST',
+      body: {
+        config: {
+          enabled: true,
+          language: LANG,
+          events: allEvents,
+          channels: [{ id: 'probe', kind: 'webhook', events: ['*'], secrets: { token: '' }, url: 'http://127.0.0.1:1/dead' }],
+        },
+      },
+    })
+    check('the dispatch probe channel was accepted', dead.status === 200 && dead.body?.ok === true, `${dead.status} ${JSON.stringify(dead.body)}`)
+
+    const session = { id: 'sess-dispatch' }
+    /* The delivery log is the observable surface: every notification the
+       handler produces ends up there, carrying the event kind. */
+    const before = await readDeliveries()
+
+    await sessionHandler(session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } } })
+    await sessionHandler(session, { type: 'turn/end', data: { turn: 2, reason: { kind: 'completed' } } })
+    await sessionHandler(session, { type: 'turn/end', data: { turn: 3, reason: { kind: 'blocked' } } })
+    await sessionHandler(session, { type: 'approval/asked', data: { id: 'a1', toolName: 'bash', reason: 'rm -rf' } })
+    await sessionHandler(session, { type: 'approval/decided', data: { id: 'a1', outcome: 'approved' } })
+    await sessionHandler(session, { type: 'tool/result', data: { callId: 'c1', name: 'bash', error: { name: 'SpawnError', code: 'ENOENT', reason: 'spawn bash ENOENT' } } })
+    /* A tool result WITHOUT an error must not notify. */
+    await sessionHandler(session, { type: 'tool/result', data: { callId: 'c2', name: 'bash' } })
+    /* An unrelated event must not notify either. */
+    await sessionHandler(session, { type: 'assistant/message', data: { turn: 4, step: 0 } })
+    /* A malformed event must not throw out of the handler. */
+    await sessionHandler(session, { type: 'turn/end' })
+    await sessionHandler(session, null)
+    await sessionHandler(undefined, undefined)
+
+    await waitFor(() => readDeliveries().then((entries) => entries.length > before.length).catch(() => false), 'at least one notification was produced')
+    const entries = await readDeliveries()
+    const kinds = entries.map((entry) => entry.event)
+    check('an aborted turn is reported as task.aborted', kinds.includes('task.aborted'), kinds.join(','))
+    check('a completed turn is reported as task.done', kinds.includes('task.done'), kinds.join(','))
+    check('a blocked turn is reported as task.blocked', kinds.includes('task.blocked'), kinds.join(','))
+    check('approval/asked is reported', kinds.includes('approval.asked'), kinds.join(','))
+    check('approval/decided is reported', kinds.includes('approval.decided'), kinds.join(','))
+    check('a failed tool result is reported', kinds.includes('tool.failed'), kinds.join(','))
+    const failedEntry = entries.find((entry) => entry.event === 'tool.failed')
+    check('the failed tool row names the tool', !!failedEntry && failedEntry.title === 'SpawnError', failedEntry ? failedEntry.title : 'not found')
+    const approvalEntry = entries.find((entry) => entry.event === 'approval.asked')
+    check('the approval row names the tool', !!approvalEntry && approvalEntry.title === 'bash', approvalEntry ? approvalEntry.title : 'not found')
+    check('a successful tool result does not notify', entries.filter((entry) => entry.event === 'tool.failed').length === 1)
+    check('an unrelated session event does not notify', !entries.some((entry) => entry.title === 'assistant/message'))
+    check('every row records the event kind', entries.every((entry) => typeof entry.event === 'string' && entry.event.length > 0), JSON.stringify(entries[0]))
+  }
+
+  /* ---- the pierce rule: quiet hours must not stall an approval ----
+
+     Every competitor in this ecosystem either has no quiet hours or applies
+     them blindly, and the result is the same: an approval request held until
+     08:00 is a task dead until 08:00, and the user blames the notifier. */
+  const pierceConfig = (quietOverrides = {}) => ({
+    enabled: true,
+    language: LANG,
+    quiet: { enabled: true, start: '00:00', end: '23:59', mode: 'digest', ...quietOverrides },
+    digest: { enabled: true, intervalMinutes: 30 },
+    events: allEvents,
+    channels: [{ id: 'probe', kind: 'webhook', events: ['*'], secrets: { token: '' }, url: 'http://127.0.0.1:1/dead' }],
+  })
+
+  await callRouteByPath(routes, '/notify-relay/config', { method: 'POST', body: { config: pierceConfig() } })
+  const pierceVerdicts = {}
+  for (const kind of mod.EVENT_KINDS) {
+    pierceVerdicts[kind.id] = mod.classify({ kind: kind.id, sessionId: 's', title: 't', body: 'b' })
+  }
+  check('approval.asked pierces quiet hours', pierceVerdicts['approval.asked'].verdict === 'send', JSON.stringify(pierceVerdicts['approval.asked']))
+  check('a routine event is still held by quiet hours', pierceVerdicts['task.failed'].verdict === 'quiet-hold', JSON.stringify(pierceVerdicts['task.failed']))
+  check('a routine event is still batched by digest', pierceVerdicts['task.failed'].verdict === 'quiet-hold' || pierceVerdicts['task.failed'].verdict === 'digest', JSON.stringify(pierceVerdicts['task.failed']))
+
+  /* Quiet hours off, digest on: the piercing event still goes now. */
+  await callRouteByPath(routes, '/notify-relay/config', { method: 'POST', body: { config: pierceConfig({ enabled: false }) } })
+  check('approval.asked pierces digest batching', mod.classify({ kind: 'approval.asked', sessionId: 's', title: 't', body: 'b' }).verdict === 'send')
+  check('a routine event is batched when quiet hours are off', mod.classify({ kind: 'task.failed', sessionId: 's', title: 't2', body: 'b' }).verdict === 'digest')
+
+  /* ---- suppression is recorded, not swallowed ----
+
+     The most common complaint about notification plugins is "I cannot tell
+     whether it fired". A log with only successful rows cannot answer that,
+     because the interesting row is the missing one. */
+  const suppressedBefore = await readDeliveries()
+  await sessionHandler({ id: 'sess-supp' }, { type: 'turn/end', data: { turn: 9, reason: { kind: 'completed' } } })
+  await sessionHandler({ id: 'sess-supp' }, { type: 'assistant/message', data: { turn: 10 } })
+  await waitFor(() => readDeliveries().then((e) => e.length > suppressedBefore.length).catch(() => false), 'a suppressed notification was recorded')
+  const suppressed = await readDeliveries()
+  const quietRow = suppressed.find((entry) => entry.suppressed === 'digest')
+  check('a digest hold is recorded with its reason', !!quietRow && /digest/i.test(String(quietRow.error)), quietRow ? quietRow.error : 'not found')
+  check('the held row names the event', !!quietRow && quietRow.event === 'task.done', quietRow ? quietRow.event : 'not found')
+  check('an ignored event leaves no row', !suppressed.some((entry) => entry.event === 'assistant/message'))
+
+  /* ---- real delivery through the plugin's own intake path ---- */
+  await realDeliveryTest(mod, ctx, eventHandlers, command, invocation, routes)
+
+  /* ---- slash command behaviour ---- */
 
   const status = await command.handler({ ...invocation, rawInput: 'status' })
   check('/notify status returns a success', status && status.kind === 'success', JSON.stringify(status))
-  check('/notify status reports the relay state', String(status.text).includes('relay:'), String(status.text).split('\n')[0])
+  check('/notify status reports the relay state', String(status.text).includes(STATUS_HEAD), String(status.text).split('\n')[0])
+  check('/notify status reports the pending retry count', /retry|重试/.test(String(status.text)), String(status.text))
 
   const badVerb = await command.handler({ ...invocation, rawInput: 'frobnicate' })
   check('/notify <unknown verb> is an error', badVerb.kind === 'error')
-  check('/notify <unknown verb> prints usage', String(badVerb.text).includes('usage:'))
+  check('/notify <unknown verb> prints usage', String(badVerb.text).includes(USAGE_MARK), String(badVerb.text))
 
   const badMute = await command.handler({ ...invocation, rawInput: 'mute' })
   check('/notify mute without minutes is an error', badMute.kind === 'error')
@@ -476,22 +697,26 @@ async function testApply(mod) {
   const muted = await command.handler({ ...invocation, rawInput: 'mute 30' })
   check('/notify mute 30 succeeds', muted.kind === 'success', muted.text)
   const statusMuted = await command.handler({ ...invocation, rawInput: 'status' })
-  check('status reflects the mute', String(statusMuted.text).includes('until'), String(statusMuted.text))
+  check('status reflects the mute', /until|恢复/.test(String(statusMuted.text)), String(statusMuted.text))
 
   const noChannel = await command.handler({ ...invocation, rawInput: 'test' })
   check('/notify test with no channel is an error', noChannel.kind === 'error', noChannel.text)
 
-  /* ---- real delivery through the plugin's own intake path ---- */
-  await realDeliveryTest(mod, ctx, eventHandlers, command, invocation, routes)
-
+  restoreHome()
   fs.rmSync(scratch, { recursive: true, force: true })
 }
 
 /**
- * Invokes one of the plugin's own route handlers with a fake (req, res) pair
- * and resolves with `{ status, body }`. Driving the plugin's real handler —
- * rather than re-implementing the read — is what proves the route works.
+ * Finds a registered route by path and drives its handler with a fake
+ * (req, res) pair. Driving the plugin's real handler — rather than
+ * re-implementing the read — is what proves the route works.
  */
+async function callRouteByPath(routes, path, options = {}) {
+  const route = routes.find((candidate) => candidate.path === path)
+  if (!route) throw new Error(`no route registered for ${path}`)
+  return callRoute(route, options)
+}
+
 function callRoute(route, options = {}) {
   return new Promise((resolve, reject) => {
     const chunks = []
@@ -516,6 +741,54 @@ function callRoute(route, options = {}) {
     }
     Promise.resolve(route.handler(req, res)).catch(reject)
   })
+}
+
+const settle = (ms = 200) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/** The language this run exercises. The gate runs the harness once per language,
+ * and the host now localizes everything it emits — digest titles, command
+ * replies, suppression reasons — so a build that only reads correctly in
+ * Chinese proves nothing about the English output.
+ */
+const LANG = process.env.HARNESS_LANG === 'en' ? 'en' : 'zh'
+
+/**
+ * The live `session/event` handler, captured at registration time.
+ *
+ * Module scope because the outbox test runs inside `realDeliveryTest`, a
+ * separate function that cannot see `testApply`'s closure — and because
+ * capturing the real handler is what makes the test drive the plugin's own
+ * dispatch path instead of a re-implementation of it.
+ */
+let currentSessionListener = null
+
+/** The localized `/notify status` head, for assertions on the command output. */
+const STATUS_HEAD = LANG === 'en' ? 'notify-relay status' : 'notify-relay 状态'
+const USAGE_MARK = LANG === 'en' ? 'usage:' : '用法'
+
+/**
+ * Waits for a condition instead of sleeping a fixed time. The delivery log is
+ * written through a serialized promise queue, so "sleep 200ms and hope" made
+ * this gate flaky under load — a flaky gate is worse than no gate, because it
+ * trains you to ignore red.
+ */
+async function waitFor(predicate, label, timeoutMs = 4000) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    let value = false
+    try {
+      value = await predicate()
+    } catch {
+      value = false
+    }
+    if (value) return true
+    if (Date.now() > deadline) {
+      console.log(`  FAIL ${label} — timed out after ${timeoutMs}ms`)
+      failures.push(label)
+      return false
+    }
+    await settle(25)
+  }
 }
 
 /**
@@ -543,36 +816,9 @@ async function realDeliveryTest(mod, ctx, eventHandlers, command, invocation, ro
   const previousHome = process.env.DSH_HOME
   process.env.DSH_HOME = scratch
 
-  const settle = (ms = 200) => new Promise((resolve) => setTimeout(resolve, ms))
-
-  /**
-   * Waits for a condition instead of sleeping a fixed time. The delivery log is
-   * written through a serialized promise queue, so "sleep 200ms and hope" made
-   * this gate flaky under load — a flaky gate is worse than no gate, because it
-   * trains you to ignore red.
-   */
-  async function waitFor(predicate, label, timeoutMs = 4000) {
-    const deadline = Date.now() + timeoutMs
-    for (;;) {
-      let value = false
-      try {
-        value = await predicate()
-      } catch {
-        value = false
-      }
-      if (value) return true
-      if (Date.now() > deadline) {
-        console.log(`  FAIL ${label} — timed out after ${timeoutMs}ms`)
-        failures.push(label)
-        return false
-      }
-      await settle(25)
-    }
-  }
-
   try {
-    /* The command gate above mutes the relay to test /notify mute; clear it so
-       the delivery assertions below start from a known state. */
+    /* Clear the mute the dispatch block above may have left set, so the
+       delivery assertions start from a known state. */
     await command.handler({ ...invocation, rawInput: 'unmute' })
 
     /* Write the config directly to the plugin's own storage location so the
@@ -581,6 +827,7 @@ async function realDeliveryTest(mod, ctx, eventHandlers, command, invocation, ro
     fs.mkdirSync(storageDir, { recursive: true })
     const deliveryConfig = {
       enabled: true,
+      language: LANG,
       events: { 'task.done': false, 'task.failed': true, 'request.failed': true, 'approval.asked': true },
       dedup: { windowMinutes: 10 },
       quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
@@ -702,12 +949,330 @@ async function realDeliveryTest(mod, ctx, eventHandlers, command, invocation, ro
     await handler({ sessionId: 'sess-live', title: 'Another failure', detail: 'BRAND-NEW-2' })
     await waitFor(() => received.length === 3, 'unmute restores delivery')
 
+    /* ---- the durable outbox ----
+
+       An in-memory retry queue loses every pending retry on restart, which is
+       the documented limitation of the best-known notifier in this ecosystem
+       (dsh-notifier's queue is process-local). So: a delivery that fails is
+       persisted, retried with a backoff, and survives a fresh plugin
+       instance reading the same home. */
+    await outboxTest(mod, server, port, scratch, invocation, routes, readLog)
+
     void ctx
   } finally {
     server.close()
     if (previousHome === undefined) delete process.env.DSH_HOME
     else process.env.DSH_HOME = previousHome
     fs.rmSync(scratch, { recursive: true, force: true })
+  }
+}
+
+/**
+ * Boots a SECOND, independent plugin instance against the same home.
+ *
+ * Two jobs at once: it isolates the outbox assertions from the state the main
+ * instance accumulated during the dispatch and delivery tests, and it IS the
+ * restart test. `apply()` is what a restart runs — it re-reads the persisted
+ * outbox, so anything still queued when the first instance goes away must come
+ * back here. An in-memory queue would not, and that is exactly the limitation
+ * this feature exists to remove.
+ */
+async function bootInstance(mod) {
+  const commands = []
+  const routes = []
+  const routeTable = new Map()
+  const eventHandlers = new Map()
+  let sessionListener = null
+  let agentListener = null
+  let live = true
+
+  const timerService = {
+    timeout(callback, delay) {
+      if (!live) return () => {}
+      return () => {}
+    },
+    interval() {
+      return () => {}
+    },
+  }
+
+  const webServer = {
+    register(route) {
+      if (routeTable.has(route.path)) throw new Error(`duplicate route: ${route.path}`)
+      routeTable.set(route.path, true)
+      routes.push(route)
+      return () => {}
+    },
+  }
+
+  const ctx = makeCtx(mod.inject, {
+    commands: { register: (definition) => commands.push(definition) },
+    timer: timerService,
+    timeout: timerService.timeout,
+    interval: timerService.interval,
+  })
+  const webCtx = makeCtx(['webServer'], { webServer })
+  Object.defineProperty(ctx, 'inject', {
+    value(services_, callback) {
+      if (typeof callback === 'function') callback(webCtx)
+      return () => {}
+    },
+    configurable: true,
+  })
+  Object.defineProperty(ctx, 'on', {
+    value(event, handler) {
+      eventHandlers.set(event, handler)
+      if (event === 'session/event') sessionListener = handler
+      if (event === 'agent/error') agentListener = handler
+      return () => {}
+    },
+    configurable: true,
+  })
+
+  /* `apply()` is async: the storage loads happen before the registrations, so
+     the instance is not usable until the returned promise settles. Skipping
+     the await yields an instance with zero commands and zero routes, which
+     reads like a plugin bug and is not one. */
+  await mod.apply(ctx)
+  const command = commands.find((entry) => entry.name === 'notify')
+  return {
+    ctx,
+    command,
+    routes,
+    sessionListener,
+    agentListener,
+    dispose() {
+      live = false
+    },
+  }
+}
+
+/**
+ * Outbox behaviour: enqueue on failure, backoff, give-up, and — the point of
+ * the whole feature — survival across a restart.
+ *
+ * The server is shared with the caller so the port stays live; it is switched
+ * into "failing" mode for the first half and back for the second.
+ */
+async function outboxTest(mod, server, port, scratch, invocation, routes, readLog) {
+  const storageDir = path.join(scratch, 'storages', 'notify-relay')
+  const outboxPath = path.join(storageDir, 'outbox.json')
+
+  /* Flip the loopback server into a 500 responder. */
+  server.removeAllListeners('request')
+  let failing = true
+  server.on('request', (req, res) => {
+    req.resume()
+    if (failing) {
+      res.writeHead(500, { 'content-type': 'application/json' })
+      res.end('{"ok":false}')
+    } else {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end('{"ok":true}')
+    }
+  })
+
+  const outboxEntries = () => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(outboxPath, 'utf8'))
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+
+  /* ---- first instance: a failed delivery is persisted ---- */
+  const first = await bootInstance(mod)
+  check('a restarted instance registers the slash command', !!first.command)
+  check('a restarted instance registers its routes', first.routes.length === 5, `${first.routes.length} routes`)
+
+  const configRoute = first.routes.find((route) => route.path === '/notify-relay/config')
+  const retryRoute = first.routes.find((route) => route.path === '/notify-relay/retry')
+
+  /* Re-arm the delivery config against the failing channel. The write goes
+     through the plugin's own route, so the loader is what validates it. */
+  await callRoute(configRoute, {
+    method: 'POST',
+    body: {
+      config: {
+        enabled: true,
+        language: LANG,
+        events: { 'task.failed': true, 'request.failed': true, 'approval.asked': true },
+        dedup: { windowMinutes: 0 },
+        quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
+        digest: { enabled: false, intervalMinutes: 30 },
+        channels: [
+          { id: 'live', kind: 'webhook', name: 'loopback', enabled: true, secrets: { token: 'live-token' }, events: ['*'], url: `http://127.0.0.1:${port}/hook` },
+        ],
+      },
+    },
+  })
+
+  /* `agent/error` is a SCOPED agent event: it is dispatched under its own
+     name, so the registered listener is the one to drive. Feeding it under
+     `session/event` would be a synthetic event DSH never dispatches, and the
+     intake would never run — a test that passes for the wrong reason. */
+  await first.agentListener({ sessionId: 'sess-outbox', title: 'boom', detail: 'ECONNRESET' })
+  await waitFor(() => outboxEntries().length === 1, 'a failed delivery is persisted to the outbox')
+
+  const queued = outboxEntries()
+  check('the outbox holds the failed notification', queued.length === 1, `${queued.length} entries`)
+  const entry = queued[0]
+  check('the outbox entry records the event kind', !!entry && entry.notification.kind === 'task.failed', entry ? entry.notification.kind : 'none')
+  check('the outbox entry records the title', !!entry && entry.notification.title === 'boom', entry ? entry.notification.title : 'none')
+  check('the outbox entry starts at attempt 1', !!entry && entry.attempts === 1, entry ? String(entry.attempts) : 'none')
+  check('the outbox entry is scheduled in the future', !!entry && entry.nextAttemptAt > Date.now(), entry ? String(entry.nextAttemptAt) : 'none')
+  check('the outbox entry records why it failed', !!entry && /live/.test(String(entry.lastError)), entry ? String(entry.lastError) : 'none')
+  check('the outbox file holds no secret', !JSON.stringify(queued).includes('live-token'), JSON.stringify(queued).slice(0, 160))
+
+  /* ---- the retry route ---- */
+  const peek = await callRoute(retryRoute)
+  check('GET /retry reports the pending count', peek.body && peek.body.pending === 1, JSON.stringify(peek.body).slice(0, 120))
+
+  const forced = await callRoute(retryRoute, { method: 'POST' })
+  check('POST /retry answers 200', forced.status === 200, String(forced.status))
+  check('POST /retry reports it retried something', forced.body && forced.body.retried === 1, JSON.stringify(forced.body).slice(0, 160))
+  const afterRetry = outboxEntries()
+  check('a retry that fails re-queues rather than dropping', afterRetry.length === 1, `${afterRetry.length} entries`)
+  check('the attempt counter advanced', afterRetry[0] && afterRetry[0].attempts === 2, afterRetry[0] ? String(afterRetry[0].attempts) : 'not found')
+  check('the backoff grows', afterRetry[0] && afterRetry[0].nextAttemptAt > entry.nextAttemptAt, `${entry.nextAttemptAt} -> ${afterRetry[0] && afterRetry[0].nextAttemptAt}`)
+
+  /* ---- heal the endpoint: the retry must clear the entry ---- */
+  failing = false
+  const healed = await callRoute(retryRoute, { method: 'POST' })
+  check('a retry that succeeds reports it', healed.body && healed.body.retried === 1, JSON.stringify(healed.body).slice(0, 160))
+  await waitFor(() => outboxEntries().length === 0, 'a successful retry clears the outbox')
+  check('the outbox is empty after a successful retry', outboxEntries().length === 0, `${outboxEntries().length} left`)
+
+  /* ---- give-up: an entry at the ceiling is dropped, not retried forever ---- */
+  fs.writeFileSync(
+    outboxPath,
+    JSON.stringify([{ notification: { kind: 'task.failed', sessionId: 'x', title: 't', body: 'b', createdAt: new Date().toISOString() }, attempts: 6, nextAttemptAt: 0, lastError: 'live: http 500' }], null, 2),
+    'utf8',
+  )
+  /* Reload through a boot so the in-memory queue matches the file — that is
+     what a restart does, and it is the only way to test the ceiling without
+     driving six real failures. */
+  const spent = await bootInstance(mod)
+  await callRoute(spent.routes.find((route) => route.path === '/notify-relay/retry'), { method: 'POST' })
+  await waitFor(() => outboxEntries().length === 0, 'an entry at the attempt ceiling is dropped')
+  check('an entry past MAX_DELIVERY_ATTEMPTS is given up on', outboxEntries().length === 0, `${outboxEntries().length} left`)
+  check('the give-up is recorded in the log', readLog().some((item) => /abandoned|attempts/i.test(String(item.error))), JSON.stringify(readLog().slice(0, 2)))
+
+  /* ---- restart survival: a third boot must see the surviving entry ---- */
+  fs.writeFileSync(
+    outboxPath,
+    JSON.stringify([{ notification: { kind: 'task.failed', sessionId: 'y', title: 'survivor', body: 'b', createdAt: new Date().toISOString() }, attempts: 1, nextAttemptAt: Date.now() + 60_000, lastError: 'live: http 500' }], null, 2),
+    'utf8',
+  )
+  const third = await bootInstance(mod)
+  const peekAfterRestart = await callRoute(third.routes.find((route) => route.path === '/notify-relay/retry'))
+  check('a restarted instance recovers the pending outbox', peekAfterRestart.body && peekAfterRestart.body.pending === 1, JSON.stringify(peekAfterRestart.body).slice(0, 120))
+  const statusAfterRestart = await third.command.handler({ ...invocation, rawInput: 'status' })
+  check('status reports the recovered pending count', /1/.test(String(statusAfterRestart.text)), String(statusAfterRestart.text))
+
+  first.dispose()
+  spent.dispose()
+  third.dispose()
+}
+
+/**
+ * Boots a variant plugin instance in isolation and drives ONE failing delivery
+ * through it, then reports what landed on disk.
+ *
+ * The shallow checks in the variant loop only see registrations. This is the
+ * one that sees behaviour: a build that keeps the retry queue in memory passes
+ * every registration assertion and still loses the queue on restart.
+ */
+async function probeOutbox({ variantMod, scratch, makeCtx }) {
+  const storageDir = path.join(scratch, 'storages', 'notify-relay')
+  const outboxPath = path.join(storageDir, 'outbox.json')
+
+  /* The variant loop restores DSH_HOME in its own finally, which runs BEFORE
+     this probe. Without re-pointing it here, every write the plugin makes
+     lands in the real user home and the probe reads an empty scratch — the
+     probe then reports "no outbox" for a build that has a perfectly good
+     outbox, and the gate green-lights a regression it never actually saw. */
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = scratch
+
+  const server = http.createServer((req, res) => {
+    req.resume()
+    res.writeHead(500, { 'content-type': 'application/json' })
+    res.end('{"ok":false}')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+
+  const commands = []
+  const routes = []
+  const handlers = new Map()
+  const table = new Map()
+  const timer = { timeout: () => () => {}, interval: () => () => {} }
+  const webServer = {
+    register(route) {
+      if (table.has(route.path)) throw new Error(`duplicate route: ${route.path}`)
+      table.set(route.path, route)
+      routes.push(route)
+      return () => {}
+    },
+  }
+  const webCtx = makeCtx(['webServer'], { webServer })
+  const ctx = makeCtx(variantMod.inject, {
+    commands: { register: (definition) => (commands.push(definition), () => {}) },
+    timer,
+    timeout: timer.timeout,
+    interval: timer.interval,
+  })
+  Object.defineProperty(ctx, 'on', { value: (event, handler) => (handlers.set(event, handler), () => {}), configurable: true })
+  Object.defineProperty(ctx, 'inject', { value: (s, cb) => (typeof cb === 'function' && cb(webCtx), () => {}), configurable: true })
+
+  const readOutbox = () => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(outboxPath, 'utf8'))
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+
+  try {
+    await variantMod.apply(ctx)
+    const configRoute = routes.find((route) => route.path === '/notify-relay/config')
+    if (!configRoute) return { booted: false }
+    const posted = await callRoute(configRoute, {
+      method: 'POST',
+      body: {
+        config: {
+          enabled: true,
+          language: 'zh',
+          events: { 'task.failed': true },
+          dedup: { windowMinutes: 0 },
+          quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
+          digest: { enabled: false, intervalMinutes: 30 },
+          channels: [{ id: 'live', kind: 'webhook', enabled: true, secrets: {}, events: ['*'], url: `http://127.0.0.1:${port}/hook` }],
+        },
+      },
+    })
+    const configOk = posted.status === 200 && posted.body && posted.body.ok === true && posted.body.config && posted.body.config.enabled === true
+    const agentListener = handlers.get('agent/error')
+    if (typeof agentListener !== 'function') return { booted: true, configOk, noListener: true }
+    await agentListener({ sessionId: 'probe', title: 'boom', detail: 'ECONNRESET' })
+    await settle(400)
+
+    const persisted = readOutbox().length > 0
+    const retryRoute = routes.find((route) => route.path === '/notify-relay/retry')
+    if (!retryRoute) return { booted: true, configOk, persisted, noRetryRoute: true }
+
+    /* Force a retry six times: a build without the give-up ceiling still holds
+       the entry afterwards, which is the unbounded-growth bug. */
+    for (let attempt = 0; attempt < 6; attempt += 1) await callRoute(retryRoute, { method: 'POST' })
+    await settle(200)
+    return { booted: true, configOk, persisted, gaveUp: readOutbox().length === 0, held: readOutbox().length }
+  } finally {
+    server.close()
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
   }
 }
 
@@ -742,9 +1307,38 @@ async function testVariants(mod, originalSource) {
       expect: ({ routes }) => !routes.some((route) => route.path === '/notify-relay/flush'),
     },
     {
-      label: 'an event listener dropped',
-      mutate: (source) => source.replace("['approval/asked', (payload) => intake('approval.asked', payload)],", ''),
-      expect: ({ handlers }) => !handlers.has('approval/asked'),
+      /* The bug that shipped in 0.1.0 and was invisible until a live boot: the
+         plugin listened on `turn/end` and `approval/asked` directly, but those
+         are SESSION event types. DSH dispatches them once, under `session/event`,
+         as `(session, event)` — there is no re-emit under the individual name.
+         So half the event coverage was a listener on an event that never fires.
+         The plugin registered, logged, answered its routes, and notified on
+         nothing. Exactly the "no notification is ever sent" failure mode that
+         dominates this ecosystem's bug reports. */
+      label: 'a listener registered on a session-event sub-name',
+      mutate: (source) =>
+        source
+          .replace("      'session/event',\n", '')
+          .replace(
+            "      ['agent/error', (payload) => intake('task.failed', payload)],",
+            "      ['agent/error', (payload) => intake('task.failed', payload)],\n      ['turn/end', (payload) => intake('task.done', payload)],\n      ['approval/asked', (payload) => intake('approval.asked', payload)],",
+          ),
+      expect: ({ handlers }) => handlers.has('turn/end') || handlers.has('approval/asked'),
+    },
+    {
+      /* The second half of the same bug, and the reason the dispatch block
+         exists: the wrapper must forward EVERY argument. `session/event` is
+         dispatched as `(session, event)`, so a wrapper written
+         `(payload) => handler(payload)` drops `event`, `event.type` reads as
+         undefined, and every branch no-ops. The plugin still registers, logs
+         and answers its routes — it just notifies on nothing. */
+      label: 'the listener wrapper drops the second argument',
+      mutate: (source) =>
+        source.replace(
+          'ctx.on(event, (...args) => {\n        void Promise.resolve(handler(...args))',
+          'ctx.on(event, (payload) => {\n        void Promise.resolve(handler(payload))',
+        ),
+      expect: ({ source }) => !/ctx\.on\(event, \(\.\.\.args\)/.test(source),
     },
     {
       label: 'the dedup clamp removed',
@@ -771,6 +1365,32 @@ async function testVariants(mod, originalSource) {
       mutate: (source) => source.replace('path: `${ROUTE_PREFIX}/log`', 'path: `${ROUTE_PREFIX}/config`'),
       expect: ({ duplicateRegistrations, routes }) =>
         duplicateRegistrations.includes('/notify-relay/config') || routes.length !== 4,
+    },
+    {
+      /* The retry queue is the whole point of the outbox. A build that keeps
+         it in memory passes every unit test and loses every pending retry on
+         restart — the documented limitation of the incumbent notifier, and the
+         reason this feature exists. */
+      label: 'the outbox is not persisted',
+      mutate: (source) => source.replace('  outbox = outbox.slice(0, MAX_OUTBOX_ENTRIES)\n  await persistOutbox()\n}', '  outbox = outbox.slice(0, MAX_OUTBOX_ENTRIES)\n}'),
+      probe: probeOutbox,
+      expect: ({ probe }) => probe && probe.persisted === false,
+    },
+    {
+      /* Without a ceiling the outbox grows forever: a failed endpoint means an
+         unbounded array of retries, which is a memory leak with a friendly
+         name. */
+      label: 'the give-up ceiling removed',
+      mutate: (source) => source.replace('if (item.attempts >= MAX_DELIVERY_ATTEMPTS) {', 'if (false) {'),
+      probe: probeOutbox,
+      expect: ({ probe }) => probe && probe.gaveUp === false,
+    },
+    {
+      /* The retry route is the only user-facing handle on the outbox. Without
+         it a failed delivery is invisible and unfixable from the UI. */
+      label: 'the retry route removed',
+      mutate: (source) => source.replace(/  \/\* One route per path, method switched inside[\s\S]*?disposers\.push\(\n    registerRoute\(\n      webServer,\n      \{\n        kind: 'exact',\n        path: `\$\{ROUTE_PREFIX\}\/retry`,[\s\S]*?\},\n      log,\n    \),\n  \)\n/, ''),
+      expect: ({ routes }) => !routes.some((route) => route.path === '/notify-relay/retry'),
     },
   ]
 
@@ -839,14 +1459,23 @@ async function testVariants(mod, originalSource) {
         clamped = `threw ${error.message}`
       }
 
-      const caught = variant.expect({ threw, routes, handlers, clamped, commands, duplicateRegistrations })
+      /* A behavioural probe: drive a real failing delivery through the mutated
+         build and look at the outbox on disk. The shallow checks above cannot
+         see this class of bug — a build that keeps the queue in memory passes
+         every registration assertion. */
+      let probe = null
+      if (variant.probe) {
+        probe = await variant.probe({ variantMod, scratch, makeCtx })
+      }
+
+      const caught = variant.expect({ threw, routes, handlers, clamped, commands, duplicateRegistrations, probe, source: mutated })
       if (caught) {
         console.log(`  ok   variant rejected: ${variant.label}`)
         checks.push(variant.label)
       } else {
         console.log(
           `  FAIL variant rejected: ${variant.label} — expected a failure, got none ` +
-            `(threw=${threw ? threw.message : 'no'}, routes=${routes.length}, handlers=${handlers.size}, clamped=${clamped}, dupes=${duplicateRegistrations.join('|') || 'none'})`,
+            `(threw=${threw ? threw.message : 'no'}, routes=${routes.length}, handlers=${handlers.size}, clamped=${clamped}, dupes=${duplicateRegistrations.join('|') || 'none'}, probe=${probe ? JSON.stringify(probe) : 'n/a'})`,
         )
         failures.push(variant.label)
       }

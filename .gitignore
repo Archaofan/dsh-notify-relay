@@ -4,6 +4,7 @@ node_modules/
 
 # Pack output
 *.tgz
+.sandbox/pack/
 
 # Runtime artifacts the gates produce
 .sandbox/received.json
@@ -11,6 +12,10 @@ node_modules/
 
 # One-off diagnostic scratch
 .sandbox/_probe*.cjs
+.sandbox/_bisect*.cjs
+.sandbox/_dbg*
+.sandbox/_fetchprobe*
+.sandbox/_head*
 .sandbox/diag.mjs
 .sandbox/_rebuild.cjs
 .sandbox/_head.tmp

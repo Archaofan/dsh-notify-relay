@@ -43,8 +43,34 @@ window.__ModuleLoader__.load({
      * Vocabulary shared with the host half.
      * ---------------------------------------------------------------- */
 
-    /** Event kinds, in host order. */
-    const EVENT_IDS = ['task.done', 'task.failed', 'request.failed', 'approval.asked']
+    /**
+     * Event kinds, in host order. This list MUST match `EVENT_KINDS` in
+     * index.js exactly: the browser half never sees the host's array, so a
+     * kind added there and forgotten here renders no switch and is silently
+     * unconfigurable from the UI. The harness asserts the count.
+     */
+    const EVENT_IDS = [
+      'task.done',
+      'task.failed',
+      'task.aborted',
+      'task.blocked',
+      'request.failed',
+      'approval.asked',
+      'approval.decided',
+      'tool.failed',
+    ]
+
+    /** kind id -> the dictionary key that labels it. */
+    const EVENT_LABEL_KEYS = {
+      'task.done': 'evTaskDone',
+      'task.failed': 'evTaskFailed',
+      'task.aborted': 'evTaskAborted',
+      'task.blocked': 'evTaskBlocked',
+      'request.failed': 'evRequestFailed',
+      'approval.asked': 'evApproval',
+      'approval.decided': 'evApprovalDecided',
+      'tool.failed': 'evToolFailed',
+    }
 
     /** Channel kinds, in host order; `labelKey` resolves through `t`. */
     const CHANNEL_KINDS = [
@@ -102,8 +128,12 @@ window.__ModuleLoader__.load({
       eventsTitle: '事件来源',
       evTaskDone: '任务完成',
       evTaskFailed: '任务失败',
+      evTaskAborted: '任务中止',
+      evTaskBlocked: '任务受阻',
       evRequestFailed: '请求失败',
       evApproval: '待审批',
+      evApprovalDecided: '审批已决',
+      evToolFailed: '工具失败',
       rulesTitle: '规则',
       dedupLabel: '去重窗口（分钟）',
       dedupHint: '同一指纹在此窗口内再次出现时只投递一次。',
@@ -146,6 +176,7 @@ window.__ModuleLoader__.load({
       flushLabel: '立即摘要',
       logOk: '成功',
       logFail: '失败',
+      logSuppressed: '未投递',
       save: '保存',
       saving: '保存中…',
       saved: '已保存',
@@ -155,6 +186,14 @@ window.__ModuleLoader__.load({
       needName: '请填写通道名称',
       needUrl: '请填写通道地址',
       maxChannels: '通道数量已达上限',
+      languageLabel: '外发语言',
+      languageHint: '决定推送到你手机上的文案语言；界面语言跟随 DSH 设置。',
+      languageZh: '中文',
+      languageEn: 'English',
+      pendingTitle: '待重试',
+      pendingHint: '投递失败的通知会按指数退避自动重试，重启不丢失。可立即重试。',
+      retryNow: '立即重试',
+      pierceNote: '待审批事件不受免打扰与摘要影响——压住它会让任务停摆。',
     }
 
     const EN = {
@@ -181,8 +220,12 @@ window.__ModuleLoader__.load({
       eventsTitle: 'Event sources',
       evTaskDone: 'Task done',
       evTaskFailed: 'Task failed',
+      evTaskAborted: 'Task aborted',
+      evTaskBlocked: 'Task blocked',
       evRequestFailed: 'Request failed',
       evApproval: 'Approval asked',
+      evApprovalDecided: 'Approval decided',
+      evToolFailed: 'Tool failed',
       rulesTitle: 'Rules',
       dedupLabel: 'Dedup window (minutes)',
       dedupHint: 'The same fingerprint inside this window is delivered only once.',
@@ -225,15 +268,24 @@ window.__ModuleLoader__.load({
       flushLabel: 'Flush digest',
       logOk: 'ok',
       logFail: 'failed',
+      logSuppressed: 'not delivered',
       save: 'Save',
       saving: 'Saving…',
       saved: 'Saved',
       saveFailed: 'Save failed',
       testSent: (n) => `Test sent to ${n} channel(s)`,
       testFailed: 'Test failed',
-      needName: 'A channel needs a name',
-      needUrl: 'This channel needs a URL',
+      needName: 'Please name the channel',
+      needUrl: 'Please fill in the channel URL',
       maxChannels: 'Channel limit reached',
+      languageLabel: 'Delivery language',
+      languageHint: 'Language of the text pushed to your phone; the UI follows the DSH setting.',
+      languageZh: '中文',
+      languageEn: 'English',
+      pendingTitle: 'Awaiting retry',
+      pendingHint: 'Failed deliveries retry with exponential backoff and survive a restart. Retry now.',
+      retryNow: 'Retry now',
+      pierceNote: 'Approval requests ignore quiet hours and digest — holding one stalls the task.',
     }
 
     /**
@@ -330,6 +382,7 @@ window.__ModuleLoader__.load({
     function emptyConfig() {
       return {
         enabled: false,
+        language: 'zh',
         events: { 'task.done': false, 'task.failed': true, 'request.failed': true, 'approval.asked': true },
         dedup: { windowMinutes: 10 },
         quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
@@ -345,6 +398,8 @@ window.__ModuleLoader__.load({
       /** Notifications the host is holding for the next digest flush. */
       held: 0,
       muted: false,
+      /** Failed deliveries waiting for a retry (the durable outbox). */
+      pending: 0,
     }
 
     const listeners = new Set()
@@ -410,6 +465,7 @@ window.__ModuleLoader__.load({
       }
       return {
         enabled: raw.enabled === true,
+        language: raw.language === 'en' ? 'en' : 'zh',
         events,
         dedup: { windowMinutes: minutes(raw.dedup?.windowMinutes, base.dedup.windowMinutes) },
         quiet: {
@@ -430,12 +486,21 @@ window.__ModuleLoader__.load({
       if (!raw || typeof raw !== 'object') return null
       return {
         at: typeof raw.at === 'string' ? raw.at : '',
+        /* Which EVENT this row is about — a completed turn, a failed request,
+           a held approval. Without it a row reads "webhook, ok" and tells you
+           nothing about what was delivered. */
+        event: typeof raw.event === 'string' ? raw.event : '',
+        title: typeof raw.title === 'string' ? raw.title : '',
         channelId: typeof raw.channelId === 'string' ? raw.channelId : '',
         kind: typeof raw.kind === 'string' ? raw.kind : '',
         ok: raw.ok === true,
         status: typeof raw.status === 'number' ? raw.status : null,
         error: typeof raw.error === 'string' ? raw.error : '',
         detail: typeof raw.detail === 'string' ? raw.detail : '',
+        /* Set when the rule center decided NOT to deliver: dedup, muted,
+           quiet-hold, quiet-drop, digest, no-channel. This is the row that
+           answers "did it fire?" — a log of successful sends alone cannot. */
+        suppressed: typeof raw.suppressed === 'string' ? raw.suppressed : '',
       }
     }
 
@@ -445,6 +510,7 @@ window.__ModuleLoader__.load({
       state.config = normalizeConfig(data.config)
       state.held = Number.isFinite(data.held) ? data.held : 0
       state.muted = data.muted === true
+      state.pending = Number.isFinite(data.pending) ? data.pending : 0
       state.loaded = true
       emitChange()
     }
@@ -478,6 +544,14 @@ window.__ModuleLoader__.load({
 
     async function flushDigest() {
       await requestJson(`${ROUTE}/flush`, { method: 'POST', headers: { accept: 'application/json' } })
+      await pullConfig()
+      await pullLog()
+    }
+
+    /** Retry every failed delivery now, instead of waiting for the backoff. */
+    async function retryPending() {
+      await requestJson(`${ROUTE}/retry`, { method: 'POST', headers: { accept: 'application/json' } })
+      await pullConfig()
       await pullLog()
     }
 
@@ -517,17 +591,21 @@ window.__ModuleLoader__.load({
 
     /** One delivery row, shared by the panel and the settings page. */
     function LogRow({ entry }) {
+      /* A row the rule center decided NOT to deliver is the most important
+         row in the log, and the one every competitor omits: "I cannot tell
+         whether it fired at all" is the dominant complaint about notification
+         plugins in this ecosystem, and a log of successful sends cannot answer
+         it, because the interesting row is the missing one. */
+      const suppressed = !!entry.suppressed
+      const tag = suppressed ? t.logSuppressed : entry.ok ? t.logOk : t.logFail
+      const detail = suppressed ? entry.error : entry.detail || entry.error || (entry.status ? `HTTP ${entry.status}` : '')
       return createElement(
         'li',
-        { className: 'dsh-relay-log-row' },
-        createElement('span', { className: 'dsh-relay-tag', 'data-ok': entry.ok ? 'true' : 'false' }, entry.ok ? t.logOk : t.logFail),
+        { className: 'dsh-relay-log-row', 'data-suppressed': suppressed ? 'true' : 'false' },
+        createElement('span', { className: 'dsh-relay-tag', 'data-ok': entry.ok ? 'true' : 'false' }, tag),
         createElement('span', { className: 'dsh-relay-log-time' }, shortTime(entry.at)),
-        createElement('span', { className: 'dsh-relay-log-chan' }, entry.channelId || entry.kind || '-'),
-        createElement(
-          'span',
-          { className: 'dsh-relay-log-detail' },
-          entry.detail || entry.error || (entry.status ? `HTTP ${entry.status}` : ''),
-        ),
+        createElement('span', { className: 'dsh-relay-log-chan' }, entry.event || entry.channelId || entry.kind || '-'),
+        createElement('span', { className: 'dsh-relay-log-detail' }, detail),
       )
     }
 
@@ -661,7 +739,7 @@ window.__ModuleLoader__.load({
               key: id,
               checked: draft.events[id],
               onChange: (value) => patch({ events: { ...draft.events, [id]: value } }),
-              label: t[{ 'task.done': 'evTaskDone', 'task.failed': 'evTaskFailed', 'request.failed': 'evRequestFailed', 'approval.asked': 'evApproval' }[id]],
+              label: t[EVENT_LABEL_KEYS[id]],
               testId: `relay-event-${id}`,
             }),
           ),
@@ -740,6 +818,44 @@ window.__ModuleLoader__.load({
             }),
           ),
           createElement('div', { className: 'dsh-relay-hint' }, t.digestHint),
+          createElement('div', { className: 'dsh-relay-hint dsh-relay-note' }, t.pierceNote),
+        ),
+
+        /* Delivery language, and the durable retry queue. */
+        createElement(
+          'div',
+          { className: 'dsh-relay-group' },
+          createElement('div', { className: 'dsh-relay-group-title' }, t.languageLabel),
+          createElement('div', { className: 'dsh-relay-hint' }, t.languageHint),
+          createElement(
+            'select',
+            {
+              value: draft.language,
+              'data-testid': 'relay-language',
+              onChange: (event) => patch({ language: event.target.value === 'en' ? 'en' : 'zh' }),
+            },
+            createElement('option', { value: 'zh' }, t.languageZh),
+            createElement('option', { value: 'en' }, t.languageEn),
+          ),
+          createElement(
+            'div',
+            { className: 'dsh-relay-group-title' },
+            snapshot.pending > 0 ? `${t.pendingTitle} · ${snapshot.pending}` : t.pendingTitle,
+          ),
+          createElement('div', { className: 'dsh-relay-hint' }, t.pendingHint),
+          createElement(
+            'button',
+            {
+              type: 'button',
+              className: 'dsh-relay-btn',
+              'data-testid': 'relay-retry',
+              disabled: snapshot.pending === 0,
+              onClick: () => {
+                void retryPending().catch(() => {})
+              },
+            },
+            t.retryNow,
+          ),
         ),
 
         /* Channels. */
@@ -916,7 +1032,7 @@ window.__ModuleLoader__.load({
                   onChange({ events: [...next] })
                 },
               }),
-              t[{ 'task.done': 'evTaskDone', 'task.failed': 'evTaskFailed', 'request.failed': 'evRequestFailed', 'approval.asked': 'evApproval' }[id]],
+              t[EVENT_LABEL_KEYS[id]],
             ),
           ),
         ),
@@ -1234,7 +1350,7 @@ window.__ModuleLoader__.load({
         RelayEditor,
         FooterAction,
         SettingsSection,
-        ids: { events: EVENT_IDS, channels: CHANNEL_KIND_IDS, redacted: REDACTED },
+        ids: { events: EVENT_IDS, channels: CHANNEL_KIND_IDS, redacted: REDACTED, labels: EVENT_LABEL_KEYS },
       }
     }
 

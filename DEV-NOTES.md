@@ -145,12 +145,116 @@ to every `label` the plugin hands to a slot.
 to the other language, and reads it again — once per language, because the
 document language is fixed per page load.
 
+## Pitfall 7 — the event vocabulary is duplicated, and the copies drifted
+
+The browser half never receives the host's `EVENT_KINDS`, so it carries its own
+`EVENT_IDS`. When the turn-end reasons were split out (`task.aborted`,
+`task.blocked`, `approval.decided`, `tool.failed`), the host list grew from four
+kinds to eight and the browser list did not move. The result was a settings page
+with four switches for eight events: four kinds were silently unconfigurable,
+and nothing in either gate noticed, because each half was internally consistent.
+
+It surfaced only in the real browser, because the fake-DOM harness asserts what
+the client renders, and the client rendered exactly what its own list said.
+
+**Fix:** one list per half, and a cross-check between them.
+
+**Guard:** the client harness imports the host's `EVENT_KINDS` and asserts the
+two lists are equal *element for element, in order* — not just the same length,
+because a reordering would silently remap every switch. It then switches the
+locale both ways and asserts every kind resolves to a real string in both
+dictionaries. A kind added to one half and not the other now fails the gate.
+
+The label mapping is read back from the client's own `EVENT_LABEL_KEYS` rather
+than derived from the id: `approval.asked` labels as `evApproval`, and a
+`evApprovalAsked` derivation would report a false failure forever.
+
+## Pitfall 8 — a mixin service's methods are on the context, not the service
+
+`@cordisjs/plugin-timer` calls `ctx.mixin('timer', [...])`, so the plugin
+correctly writes `hostCtx.timeout(...)` — the method lives directly on the
+context, not under `ctx.timer`. The first harness offered only
+`ctx.timer.timeout`, and the fail-loud proxy rightly refused `ctx.timeout`.
+
+That mismatch stayed latent because the digest path was never reached with a
+queued item, so the gate stayed green over a code path it had never executed.
+It surfaced the moment an outbox test held a real failed delivery.
+
+**Fix:** the fake ctx provides both surfaces, and `makeCtx` allows a mixin's
+method names whenever the mixin service itself is declared — because that is
+precisely the contract a mixin has with the runner.
+
+## Pitfall 9 — the outbox probe read the wrong home
+
+The variant runner restores `DSH_HOME` in its own `finally`, which runs *before*
+the behavioural probe. Every write the mutated plugin made therefore landed in
+the real user home while the probe read an empty scratch, so the probe reported
+"no outbox" for a build that had a perfectly good outbox — and the gate
+green-lit a regression it never actually saw.
+
+**Fix:** the probe re-points `DSH_HOME` at the scratch and restores it itself.
+
+**Guard:** the probe asserts the config POST landed *and* that the outbox file
+exists before drawing any conclusion, so a probe that cannot see the plugin's
+output reports that instead of reporting success.
+
+## Pitfall 10 — `agent/*` events are dispatched under their own name
+
+`agent/error` and `agent/request-error` are **scoped agent events**: they are
+dispatched under their own names, so `ctx.on('agent/error')` is correct.
+Everything in `SessionEventMap` — `turn/end`, `approval/asked`, `tool/result` —
+arrives once, under `session/event`, as `(session, event)` with the real name in
+`event.type`. Registering `ctx.on('turn/end')` buys a listener on an event DSH
+never dispatches.
+
+The first outbox test fed a synthetic `{ type: 'agent/error' }` pair to the
+`session/event` listener. Nothing fired, no log row appeared, and the test
+reported "the outbox is empty" for a build whose outbox was fine. A test that
+passes for the wrong reason is worse than no test.
+
+**Guard:** the harness keeps a `DISPATCHED_EVENT_NAMES` registry and asserts
+every registered listener name is in it, that `HOST_EVENT_NAMES` matches the
+real registrations, and that no listener sits on a session sub-name. Two broken
+variants reproduce the dead-listener and dropped-argument forms of this bug.
+
 ## Storage and atomicity
 
-Config and delivery log live under `dshHomePath('storages', PLUGIN_ID, …)`,
+Config, delivery log and outbox live under `dshHomePath('storages', PLUGIN_ID, …)`,
 which honours `DSH_HOME` (so the harness can point it at a scratch directory).
 Writes go to a `.tmp` sibling and then `rename`, so a crash mid-write cannot
 leave a half-parsed JSON file that would silently reset the user's config.
+
+All three share one serialized promise queue, so concurrent writes cannot
+interleave and a `.tmp` file is never observed half-written.
+
+## The outbox
+
+A delivery that reached no channel, or reached one that failed, is persisted to
+`outbox.json` with an attempt counter and a `nextAttemptAt`. The backoff is
+`min(30s · 2^(attempts-1), 30min)`. An entry at `MAX_DELIVERY_ATTEMPTS` is
+dropped, and the drop is recorded in the delivery log with the last error —
+an outbox that grows without bound is a memory leak with a friendly name.
+
+`apply()` loads the outbox and re-arms the drain timer, so a restart resumes the
+queue instead of abandoning it. That is the whole reason the outbox is on disk:
+an in-memory queue loses every pending retry on restart, which is the documented
+limitation of the incumbent notifier in this ecosystem.
+
+`GET /retry` reports the pending count; `POST /retry` drains immediately,
+ignoring the backoff, because "the log says failed — now what?" is the question
+the backoff does not answer.
+
+## Host-side copy
+
+The browser half has `ctx.locale` and follows the UI. The host has no such
+service, so everything the host emits — digest titles, `/notify` replies,
+suppression reasons — comes from `HOST_STRINGS` selected by `config.language`
+(`'zh'` | `'en'`, default `'zh'`).
+
+This matters more than it sounds. The half a user actually reads is the half
+that arrives on a phone at 2am; a notification in a language they do not read is
+worse than no notification, and "hardcoded Chinese runtime strings" is the
+longest-standing open i18n complaint against the incumbent.
 
 `ctx.settings.register` is deliberately **not** used. It would create a second
 source of truth for the same values, and the browser half has no clean read path
@@ -178,3 +282,6 @@ against the stored mask at save time.
 - Concurrent browser tabs. `GET /config` re-reads from disk on every call, so an
   external edit is picked up on the next poll, but two tabs editing at once will
   clobber each other.
+- A restart under load. The outbox's restart recovery is proven by booting a
+  second instance against the same home and reading the pending count back, not
+  by killing a live process mid-delivery.

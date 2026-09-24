@@ -134,7 +134,36 @@ async function main() {
     const entries = Array.isArray(log.json) ? log.json : log.json.entries
     check(Array.isArray(entries), 'the log is a list', typeof entries)
     check(!JSON.stringify(log.json).includes('live-secret'), 'the log exposes no secret', JSON.stringify(log.json).slice(0, 200))
+    /* Every row must say WHICH EVENT it is about. A log of "webhook, ok"
+       cannot answer "did it fire?", which is the question users actually
+       ask — and the one this ecosystem's bug reports are dominated by. */
+    check(entries.every((entry) => typeof entry.event === 'string' && entry.event.length > 0), 'every log row names its event', JSON.stringify(entries[0]).slice(0, 160))
+    check(entries.some((entry) => entry.event === 'test'), 'the test delivery is attributed to the test event', JSON.stringify(entries[0]).slice(0, 160))
+    check(entries.every((entry) => typeof entry.title === 'string'), 'every log row carries a title', JSON.stringify(entries[0]).slice(0, 160))
   }
+
+  console.log('\n— the retry route and the language field —')
+  const pending = await api('/notify-relay/retry')
+  check(pending.status === 200, 'GET /notify-relay/retry answers', `${pending.status} ${pending.text.slice(0, 120)}`)
+  check(pending.json && Number.isFinite(pending.json.pending), 'the retry route reports the pending count', pending.text.slice(0, 120))
+  const flushed = await api('/notify-relay/retry', { method: 'POST', body: {} })
+  check(flushed.status === 200, 'POST /notify-relay/retry answers', `${flushed.status} ${flushed.text.slice(0, 160)}`)
+  check(flushed.json && Number.isFinite(flushed.json.retried), 'POST /retry reports how many it retried', flushed.text.slice(0, 160))
+
+  /* The delivery language is the field the host uses for everything it emits.
+     An invalid value must fall back rather than throw. */
+  const langProbe = await api('/notify-relay/config', {
+    method: 'POST',
+    body: { config: { ...webhookConfig, language: 'en', events: { 'task.failed': true } } },
+  })
+  check(langProbe.json && langProbe.json.config.language === 'en', 'the delivery language round-trips', langProbe.text.slice(0, 160))
+  const langBack = await api('/notify-relay/config')
+  check(langBack.json && langBack.json.config.language === 'en', 'the delivery language persists', langBack.text.slice(0, 160))
+  const langJunk = await api('/notify-relay/config', {
+    method: 'POST',
+    body: { config: { ...webhookConfig, language: 'klingon' } },
+  })
+  check(langJunk.json && langJunk.json.config.language === 'zh', 'an unknown language falls back to zh', langJunk.text.slice(0, 160))
 
   console.log('\n— reset the plugin to its defaults —')
   const reset = await api('/notify-relay/config', { method: 'POST', body: { config: null } })

@@ -129,6 +129,10 @@ global.window = {
   matchMedia: () => ({ matches: false, addEventListener() {} }),
   getComputedStyle: () => ({ getPropertyValue: () => '' }),
   requestAnimationFrame: (fn) => fn(),
+  /* The client half only publishes its internals (including the event-vocabulary
+     list the host/client parity check compares) when this flag is set. In the
+     real GUI it is never set, so nothing internal leaks into production. */
+  __DSH_NOTIFY_TEST__: true,
 }
 
 /* ------------------------------------------------------------------ *
@@ -353,12 +357,16 @@ const hostConfig = {
 }
 
 const hostLog = [
-  { at: '2026-09-25T10:00:00.000Z', channelId: 'live', kind: 'task.failed', ok: true, status: 200, ms: 120 },
-  { at: '2026-09-25T09:00:00.000Z', channelId: 'live', kind: 'request.failed', ok: false, status: 500, error: 'http 500', ms: 80 },
+  { at: '2026-09-25T10:00:00.000Z', event: 'task.failed', title: 'turn 3 failed', channelId: 'live', kind: 'webhook', ok: true, status: 200, ms: 120 },
+  { at: '2026-09-25T09:00:00.000Z', event: 'request.failed', title: 'HTTP 500', channelId: 'live', kind: 'webhook', ok: false, status: 500, error: 'http 500', ms: 80 },
+  /* A row the rule center chose not to deliver. The interesting row is the
+     one every competitor omits. */
+  { at: '2026-09-25T08:00:00.000Z', event: 'task.done', title: '', channelId: '', kind: '', ok: false, suppressed: 'digest', error: 'digest batching on', ms: 0 },
 ]
 
 const posts = []
 let held = 0
+let pending = 0
 
 const fakeFetch = async (url, options = {}) => {
   const method = options.method || 'GET'
@@ -369,11 +377,11 @@ const fakeFetch = async (url, options = {}) => {
     return {
       ok: true,
       status: 200,
-      json: async () => ({ ok: true, config: hostConfig, held }),
+      json: async () => ({ ok: true, config: hostConfig, held, muted: false, pending }),
     }
   }
   if (String(url).endsWith('/notify-relay/config')) {
-    return { ok: true, status: 200, json: async () => ({ ok: true, config: hostConfig, held, muted: false }) }
+    return { ok: true, status: 200, json: async () => ({ ok: true, config: hostConfig, held, muted: false, pending }) }
   }
   if (String(url).endsWith('/notify-relay/log')) {
     return { ok: true, status: 200, json: async () => ({ ok: true, entries: hostLog }) }
@@ -428,6 +436,15 @@ const loader = {
     global.__exports__ = returned && typeof returned === 'object' && 'apply' in returned ? returned : null
   },
 }
+
+/* The browser half never receives the host's EVENT_KINDS, so its own list is
+   the only thing standing between a new event kind and a UI that cannot
+   configure it. That is not a hypothetical: `task.aborted`, `task.blocked`,
+   `approval.decided` and `tool.failed` were all added to the host and missed
+   here, which shipped a settings page with four switches for eight events.
+   Comparing the two lists is the only check that catches it. */
+const hostModule = require('../index.js')
+const hostEventKinds = hostModule.EVENT_KINDS.map((kind) => kind.id)
 
 /* The stub React forwards to whichever instance mount() is rendering. */
 global.window.__ModuleLoader__ = loader
@@ -705,8 +722,53 @@ async function main() {
   check('channel kind select lists all 7 kinds', kindSelect[0] && flatten(kindSelect[0]).filter((node) => node.type === 'option').length === 7)
 
   const logRows = flatten(tree).filter((node) => node.props && node.props.className === 'dsh-relay-log-row')
-  check('delivery log rows rendered', logRows.length === 2, `${logRows.length} found`)
+  check('delivery log rows rendered', logRows.length === 3, `${logRows.length} found`)
   check('a failed delivery is marked failed', textOf(tree).includes(LANG === 'en' ? 'failed' : '失败'))
+
+  /* ---- the event vocabulary must match the host, kind for kind ---- */
+  const clientEventIds = clientExports.__test__ ? clientExports.__test__.ids.events : null
+  const labelKeys = clientExports.__test__ ? clientExports.__test__.ids.labels : null
+  check('the client exposes its event list for comparison', Array.isArray(clientEventIds), String(clientEventIds))
+  if (Array.isArray(clientEventIds)) {
+    check(
+      'the client event list matches the host EVENT_KINDS exactly',
+      clientEventIds.length === hostEventKinds.length && clientEventIds.every((id, index) => id === hostEventKinds[index]),
+      `client=[${clientEventIds.join(',')}] host=[${hostEventKinds.join(',')}]`,
+    )
+    /* Every kind needs a label in BOTH dictionaries, or the switch renders
+       with the raw key as its caption in the language nobody tested. The
+       mapping is the client's own, so ask it rather than deriving a key —
+       `approval.asked` labels as `evApproval`, not `evApprovalAsked`. */
+    check('every event kind has a label key', labelKeys && clientEventIds.every((id) => typeof labelKeys[id] === 'string'), JSON.stringify(labelKeys))
+    if (labelKeys) {
+      for (const locale of ['zh', 'en']) {
+        fakeLocale.setLocale(locale)
+        const dict = clientExports.__test__.t
+        const missing = clientEventIds.filter((id) => {
+          const value = dict[labelKeys[id]]
+          return typeof value !== 'string' || value.length === 0
+        })
+        check(`every event kind has a ${locale} label`, missing.length === 0, missing.map((id) => labelKeys[id]).join(','))
+      }
+      fakeLocale.setLocale(LANG)
+    }
+  }
+
+  /* ---- the observability surface ----
+
+     The most common complaint about notification plugins in this ecosystem is
+     "I cannot tell whether it fired". So the log must show the rows where the
+     rule center decided NOT to deliver, must name the EVENT (not just the
+     channel), and the retry queue must be reachable. */
+  const suppressedRows = logRows.filter((node) => node.props['data-suppressed'] === 'true')
+  check('a suppressed row is marked as such', suppressedRows.length === 1, `${suppressedRows.length} found`)
+  check('the suppressed row names the verdict reason', textOf(suppressedRows[0] || { props: {} }).includes('digest'), textOf(suppressedRows[0] || { props: {} }))
+  check('a row names the event, not just the channel', logRows.some((node) => textOf(node).includes('task.failed')), JSON.stringify(logRows.map((n) => textOf(n))))
+  check('the retry button is disabled when nothing is pending', byTestId(tree, 'relay-retry')[0]?.props.disabled === true, String(byTestId(tree, 'relay-retry')[0]?.props.disabled))
+
+  const languageSelect = byTestId(tree, 'relay-language')
+  check('delivery language select rendered', languageSelect.length === 1)
+  check('delivery language offers zh and en', flatten(languageSelect[0] || { props: {} }).filter((node) => node.type === 'option').length === 2)
 
   /* ------------------------------------------------------------------ *
    * 7. drive the editor: toggle + save, and prove the round-trip contract
