@@ -1,0 +1,19 @@
+fix: screenshots.json must be a list of paths, not of objects
+
+The registry's probe-screenshots.mjs reads the author's own screenshots.json
+and accepts exactly three shapes: a bare array, {"screenshots": [...]}, or a
+single-key map — and every element must be a non-empty STRING. The first
+version here declared objects with file/alt/caption, so the whole declaration
+was rejected as malformed.
+
+That failure is silent rather than loud: a malformed declaration falls back to
+the registry-side data/screenshots.json, which this plugin has no entry in, so
+the result is no screenshots at all rather than an error. The registry's
+reasoning for that is sound — a broken picture must degrade the site, not
+block the build — but it means the mistake surfaces as an absence nobody
+reported.
+
+Validated against the probe's real logic: three paths, all strings, under the
+cap of eight, and all three resolve at HEAD over raw.githubusercontent.com.
+The alt text and captions were dropped rather than worked around; the registry
+has no field for them, and inventing a shape it would reject buys nothing.

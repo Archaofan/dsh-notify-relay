@@ -1,38 +1,7 @@
 {
-  "$schema": "https://raw.githubusercontent.com/awesome-dsh-plugin/awesome-dsh-plugin/main/docs/screenshots.schema.json",
   "screenshots": [
-    {
-      "file": "docs/screenshots/settings.png",
-      "alt": {
-        "en": "The rule center: eight event switches, dedup window, quiet hours, digest batching, delivery language and the deep link, each channel listed below with its own events filter.",
-        "zh": "规则中枢：八类事件开关、去重窗口、免打扰时段、摘要合批、外发语言与点击跳转，下方是各通道及其事件过滤。"
-      },
-      "caption": {
-        "en": "The rule center — every rule in one official settings section.",
-        "zh": "规则中枢 —— 全部规则集中在一个官方设置分区里。"
-      }
-    },
-    {
-      "file": "docs/screenshots/channels.png",
-      "alt": {
-        "en": "The channel editor: one card per channel with its type, endpoint, masked secret and event filter, plus a breaker banner and the deep-link field.",
-        "zh": "通道编辑器：每个通道一张卡片，含类型、地址、脱敏密钥与事件过滤，另有熔断提示条与点击跳转字段。"
-      },
-      "caption": {
-        "en": "Channels, with the deep link and any open breaker explained on the card.",
-        "zh": "通道卡片上直接说明点击跳转与熔断状态。"
-      }
-    },
-    {
-      "file": "docs/screenshots/pill.png",
-      "alt": {
-        "en": "The sidebar footer pill beside its delivery panel: every delivery attempt with its event, channel, severity badge and result, including the ones that did not go out.",
-        "zh": "侧栏底部的状态胶囊与投递面板：每一次投递尝试连同事件、通道、严重度徽标和结果，含未发出的那些。"
-      },
-      "caption": {
-        "en": "The pill and its delivery panel — what went out, what did not, and why.",
-        "zh": "状态胶囊与投递面板 —— 发了什么、没发什么、为什么。"
-      }
-    }
+    "docs/screenshots/settings.png",
+    "docs/screenshots/channels.png",
+    "docs/screenshots/pill.png"
   ]
 }
