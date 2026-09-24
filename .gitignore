@@ -15,3 +15,4 @@ node_modules/
 .sandbox/_rebuild.cjs
 .sandbox/_head.tmp
 .sandbox/_tail.tmp
+.sandbox/release-notes.md
