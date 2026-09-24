@@ -18,6 +18,12 @@
   "license": "MIT",
   "type": "module",
   "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Archaofan/dsh-notify-relay.git"
+  },
+  "homepage": "https://github.com/Archaofan/dsh-notify-relay#readme",
+  "bugs": "https://github.com/Archaofan/dsh-notify-relay/issues",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js"
