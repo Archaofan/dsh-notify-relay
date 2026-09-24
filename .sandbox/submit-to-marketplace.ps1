@@ -28,9 +28,22 @@ $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Entry = Join-Path $PSScriptRoot 'marketplace-entry.yml'
-$EntryName = 'Archaofan__dsh-notify-relay.yml'
 $Upstream = 'awesome-dsh-plugin/awesome-dsh-plugin'
 $Branch = 'add-dsh-notify-relay'
+
+# The entry filename is DERIVED, not hardcoded. The registry enforces the
+# pairing itself -- scripts/lib/entries.mjs rejects any entry whose file
+# basename does not match the slug of its `url:`:
+#
+#   if (e.file && path.basename(e.file, '.yml') !== want) {
+#     problems.push(`${at}: filename must match the url -- expected ${want}.yml`)
+#
+# and slugFor() is: strip https://github.com/, take the first two path
+# segments, replace '/' with '__'. A hardcoded name that once matched the URL
+# would keep passing every local check and then be rejected by CI the moment
+# the repo were ever renamed or moved -- a failure that only shows up inside
+# the gate window. Deriving it here makes that class of drift impossible.
+$ExpectedEntryName = 'Archaofan__dsh-notify-relay.yml'
 
 function Step($message) { Write-Host "`n-- $message --" }
 
@@ -39,6 +52,23 @@ function Step($message) { Write-Host "`n-- $message --" }
 # ------------------------------------------------------------------------- *
 Step 'the entry'
 if (-not (Test-Path $Entry)) { throw "missing $Entry" }
+
+# The filename the registry will require, derived from the entry's own `url:`
+# by the registry's own rule. Computed before anything else so every later step
+# (and the PR body) names the file that will actually land.
+$urlLine = ([System.IO.File]::ReadAllLines($Entry, (New-Object System.Text.UTF8Encoding($false))) |
+  Where-Object { $_ -match '^url:\s*\S+' } | Select-Object -First 1)
+if (-not $urlLine) { throw "the entry declares no url: field" }
+$url = ($urlLine -replace '^url:\s*', '').Trim().TrimEnd('/')
+if ($url -notmatch '^https://github\.com/[^/]+/[^/]+$') {
+  throw "the entry url is not an https://github.com/owner/repo link: $url"
+}
+$segments = $url -replace '^https://github\.com/', '' -split '/'
+$EntryName = "$($segments[0])__$($segments[1]).yml"
+if ($EntryName -ne $ExpectedEntryName) {
+  throw "derived entry name '$EntryName' does not match the expected '$ExpectedEntryName' -- the url or the expectation has drifted"
+}
+Write-Host "  ok   entry filename derived from its url: $EntryName"
 
 # Read as UTF-8 EXPLICITLY. `Get-Content -Raw` with no -Encoding decodes with
 # the machine's ANSI code page -- GBK here -- and the entry is UTF-8 with
