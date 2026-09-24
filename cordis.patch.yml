@@ -1,0 +1,14 @@
+# dsh-notify-relay bundle patch
+#
+# Installed through the official CLI — `dsh plugin --profile <name> add <spec>` —
+# which reconciles `dsh.profile.bundles` against installed packages and, seeing
+# the `dsh.bundle.patch` declaration, appends `notify-relay` to the bundle
+# stack. The profile boot then merges THIS patch (a single `insert` of the
+# plugin row) — no manual profile file edits needed.
+#
+# The host half tolerates an already-registered route or slash command (see
+# registerRoute / registerCommand in index.js), so a second mount stands down
+# instead of failing the whole plugin tree.
+- insert:
+    - id: notify-relay
+      name: dsh-notify-relay

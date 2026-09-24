@@ -1,0 +1,50 @@
+{
+  "name": "dsh-notify-relay",
+  "version": "0.1.0",
+  "description": "DSH 通知中继：把任务完成/失败/待审批等生命周期事件经过去重、免打扰、摘要合批的规则中枢，外联到 Bark/Server酱/Telegram/企业微信/飞书/ntfy/通用 webhook。零运行时依赖。",
+  "descriptionEn": "Outbound notification rule center for DSH: routes lifecycle events (task done / failed / approval asked) through dedup, quiet hours and digest batching into Bark, ServerChan, Telegram, WeCom, Feishu, ntfy or any webhook. Zero runtime dependencies.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "notification",
+    "webhook",
+    "bark",
+    "telegram",
+    "feishu",
+    "wecom",
+    "ntfy",
+    "quiet-hours"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-modules"
+      ]
+    }
+  },
+  "engines": {
+    "dsh": ">=0.1.6-alpha.1"
+  },
+  "devDependencies": {
+    "playwright": "^1.49.0"
+  }
+}

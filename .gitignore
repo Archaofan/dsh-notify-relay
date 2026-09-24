@@ -1,0 +1,17 @@
+# Dependencies — node_modules is a junction into the local sandbox so the
+# harnesses can resolve @deepseek-ai/dsh-home-paths. Never commit it.
+node_modules/
+
+# Pack output
+*.tgz
+
+# Runtime artifacts the gates produce
+.sandbox/received.json
+.sandbox/variant-*.mjs
+
+# One-off diagnostic scratch
+.sandbox/_probe*.cjs
+.sandbox/diag.mjs
+.sandbox/_rebuild.cjs
+.sandbox/_head.tmp
+.sandbox/_tail.tmp
