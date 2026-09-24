@@ -72,7 +72,7 @@ DSH 自己的语言设置；**推送到你手机上的文案语言单独可设**
 dsh plugin --profile web add github:Archaofan/dsh-notify-relay --ignore-scripts
 
 # 或本地目录 / tarball
-dsh plugin --profile web add file:./dsh-notify-relay-0.3.1.tgz --ignore-scripts
+dsh plugin --profile web add file:./dsh-notify-relay-0.3.3.tgz --ignore-scripts
 ```
 
 `--ignore-scripts` 是必要的：本插件没有安装脚本，也没有运行时依赖，拒绝执行它们

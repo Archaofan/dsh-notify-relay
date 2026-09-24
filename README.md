@@ -80,7 +80,7 @@ every click), which affects the *test harness* rather than the plugin.
 dsh plugin --profile web add github:Archaofan/dsh-notify-relay --ignore-scripts
 
 # or from a local checkout / tarball
-dsh plugin --profile web add file:./dsh-notify-relay-0.3.1.tgz --ignore-scripts
+dsh plugin --profile web add file:./dsh-notify-relay-0.3.3.tgz --ignore-scripts
 ```
 
 `--ignore-scripts` matters: the plugin has no install scripts and no runtime

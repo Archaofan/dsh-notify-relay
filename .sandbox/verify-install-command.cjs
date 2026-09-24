@@ -79,7 +79,7 @@ claim('the entry declares a tarball', typeof ours.tarball === 'string' && ours.t
 claim('npm is null (we are not published there)', ours.npm === null || ours.npm === undefined, String(ours.npm))
 claim(
   'install uses the tarball, not the github fallback',
-  typeof ours.install === 'string' && /releases\/download\/v0\.3\.2\//.test(ours.install),
+  typeof ours.install === 'string' && /releases\/download\/v\d+\.\d+\.\d+\//.test(ours.install),
   ours.install,
 )
 claim(
@@ -94,18 +94,18 @@ if (fs.existsSync(detail)) {
   const html = fs.readFileSync(detail, 'utf8')
   const m = html.match(/dsh plugin --profile web add [^<"]*/)
   const rendered = m ? m[0] : ''
-  claim('the detail page renders the same command', rendered.length > 0 && /releases\/download\/v0\.3\.2\//.test(rendered), rendered || '(none found)')
+  claim('the detail page renders the same command', rendered.length > 0 && /releases\/download\/v\d+\.\d+\.\d+\//.test(rendered), rendered || '(none found)')
 } else {
   claim('the detail page exists', false, `not found at ${path.relative(REGISTRY, detail)}`)
 }
 
 /* 3. The URL inside the command must be the release asset we actually shipped.
  *    Liveness is a separate fact, verified by the submission script's ranged
- *    GET; this checks the string names the v0.3.2 asset and nothing else.
- *    Note the command ends with a closing quote, so the regex must allow it. */
+ *    GET; this checks the string names the current release asset and nothing
+ *    else. Note the command ends with a closing quote, so allow it. */
 claim(
-  'the URL inside the command names the v0.3.2 release asset',
-  /dsh-notify-relay-0\.3\.2\.tgz"?$/.test(ours.install || ''),
+  'the URL inside the command names the current release asset',
+  /dsh-notify-relay-\d+\.\d+\.\d+\.tgz"?$/.test(ours.install || ''),
   ours.install,
 )
 

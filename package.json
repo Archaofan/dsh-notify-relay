@@ -1,6 +1,6 @@
 {
   "name": "dsh-notify-relay",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "DSH 通知中继：把任务完成/失败/待审批等生命周期事件经过去重、免打扰、摘要合批的规则中枢，外联到 Bark/Server酱/Telegram/企业微信/飞书/ntfy/通用 webhook。失败自动重试且重启不丢。严重度分级（Bark level/call、ntfy Priority）、单通道熔断、抖动退避、外联自检告警。零运行时依赖。",
   "descriptionEn": "Outbound notification rule center for DSH: routes lifecycle events (task done / failed / approval asked) through dedup, quiet hours and digest batching into Bark, ServerChan, Telegram, WeCom, Feishu, ntfy or any webhook. Failed deliveries retry with jittered backoff and survive a restart. Severity maps to each channel's native field (Bark level/call, ntfy Priority), per-channel circuit breakers stop hammering a dead endpoint, and a self-check reports its own degradation instead of going silent. Zero runtime dependencies.",
   "keywords": [
@@ -54,7 +54,7 @@
     }
   },
   "engines": {
-    "dsh": ">=0.1.6-alpha.1"
+    "dsh": ">=0.1.6-alpha.1 <0.1.7 || >=0.1.7-alpha.1 <0.2.0-0"
   },
   "scripts": {
     "check": "node --check index.js && node --check client.js",
@@ -67,5 +67,9 @@
   },
   "devDependencies": {
     "playwright": "^1.49.0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-home-paths": ">=0.1.6-alpha.1 <0.1.7 || >=0.1.7-alpha.1 <0.2.0-0",
+    "@deepseek-ai/dsh-tools": ">=0.1.6-alpha.1 <0.1.7 || >=0.1.7-alpha.1 <0.2.0-0"
   }
 }
