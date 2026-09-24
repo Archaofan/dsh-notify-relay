@@ -39,8 +39,17 @@ function Step($message) { Write-Host "`n-- $message --" }
 # ------------------------------------------------------------------------- *
 Step 'the entry'
 if (-not (Test-Path $Entry)) { throw "missing $Entry" }
-$text = Get-Content $Entry -Raw
-Write-Host "  ok   $EntryName ($($text.Length) bytes)"
+
+# Read as UTF-8 EXPLICITLY. `Get-Content -Raw` with no -Encoding decodes with
+# the machine's ANSI code page -- GBK here -- and the entry is UTF-8 with
+# Chinese in it. The damage is not only cosmetic: the bytes E3 80 82 0A
+# (U+3002 ideographic full stop, then LF) decode as ONE two-byte GBK pair,
+# because 82 is a GBK lead byte and 0A is a legal trail byte. The newline
+# before `tarball:` is swallowed, the tarball line stops being its own line,
+# and the parse below finds nothing -- a crash at the moment of submission.
+# Measured: 805 chars decoded as GBK against 752 as UTF-8.
+$text = [System.IO.File]::ReadAllText($Entry, (New-Object System.Text.UTF8Encoding($false)))
+Write-Host "  ok   $EntryName ($([System.Text.Encoding]::UTF8.GetByteCount($text)) bytes)"
 
 # Every field the contributing guide requires, checked here rather than left
 # for CI: a red X on someone else's workflow is a slower way to learn about a
@@ -100,9 +109,13 @@ Write-Host '  ok   package.json declares dsh.bundle'
 # 3. the release asset the entry points at must be live
 # ------------------------------------------------------------------------- *
 Step 'the release asset'
-$tarball = (($text -split "`n") | Where-Object { $_.TrimStart().StartsWith('tarball:') } | Select-Object -First 1) -replace '^tarball:\s*', ''
-$tarball = $tarball.Trim()
-if (-not $tarball) { throw 'the entry declares no tarball' }
+# Pull the tarball URL with a regex rather than a line split. A split still
+# works now that the read is explicit UTF-8, but a match on the whole text
+# cannot be broken by a line-ending surprise, and it returns one string
+# instead of whatever the pipeline happened to emit.
+$m = [regex]::Match($text, '(?m)^\s*tarball:\s*(?<u>\S+)\s*$')
+if (-not $m.Success) { throw 'the entry declares no tarball' }
+$tarball = $m.Groups['u'].Value
 Write-Host "  $tarball"
 $request = [System.Net.HttpWebRequest]::Create($tarball)
 $request.Method = 'GET'
@@ -184,8 +197,8 @@ An outbound notification rule center for DSH. Eight lifecycle events go
 through dedup, quiet hours and digest batching, then out to seven channels.
 Severity maps to the fields Bark, ntfy, Telegram and webhooks actually
 support; failed deliveries retry with jittered backoff and survive a restart;
-per-channel circuit breakers stop hammering a dead endpoint; and an hourly
-self-check reports a degraded relay instead of going silent.
+per-channel circuit breakers stop hammering a dead endpoint; and a self-check
+reports a degraded relay instead of going silent.
 
 Zero runtime dependencies, no build step, two source files, bilingual.
 
