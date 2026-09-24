@@ -390,3 +390,59 @@ The thesis that survived all three research reports: **the decision layer is the
 product, not the channel list.** Seven channels that are reliably filtered,
 correctly prioritised and honestly self-reporting beat twenty-seven that fire
 everything at everyone.
+
+## Publishing to the marketplace
+
+There is no official DSH marketplace. `dsh plugin add` is a pnpm forwarder, and
+the de-facto registry is the community `awesome-dsh-plugin/awesome-dsh-plugin`
+list (≈16.8k stars) → awesome-dsh-plugin.com → consumed by the `dsh-market`
+plugin, dshmarket.com and dshget.com. `dsh-market`'s README is explicit: installs
+are restricted to sources listed in that curated registry, so being on it is what
+makes the plugin installable from a storefront at all.
+
+The submission is **one PR adding one file**: `data/plugins/<owner>__<repo>.yml`.
+The two READMEs in that repo are generated from `data/plugins/*.yml` and are
+regenerated on `main` after the merge, so a yml-only PR never conflicts with
+anyone. Hand-editing them is the one thing the contributing guide asks you not to
+do.
+
+Five things the gate checks, and how each was satisfied:
+
+| Bar | Status |
+| --- | --- |
+| `dsh.bundle` in `package.json` | Present since 0.1.0. Declaring only `dsh.client` is the most common rejection reason — it is not installable |
+| Repo at least 1 day old | **The only blocker.** Created 2026-09-24T16:25Z; clears 2026-09-25T16:25Z. The checker says it re-runs itself and no resubmission is needed |
+| `dsh-plugin` GitHub topic | Added |
+| Category `notify` | Correct — the plugin notifies, it does not enhance the UI |
+| `description.en` accurate, ends with a period, no superlatives | Checked against the source: eight events, seven channels, severity mapped only where the vendor has a field |
+
+The **age bar is checked automatically and cannot be satisfied early.** That is
+the whole reason the submission is a script (`.sandbox/submit-to-marketplace.ps1`)
+rather than a command that was run once: everything else was verified before
+writing it, by running the registry's own `check-submission.mjs` against the
+entry locally — the age failure was the only one, and the checker's own message
+says nothing needs resubmitting.
+
+Two traps worth recording, both hit while building that script:
+
+- **A malformed `screenshots.json` fails silently.** The registry's
+  `probe-screenshots.mjs` reads the author's own `screenshots.json` and accepts
+  only a bare array, `{"screenshots": [...]}`, or a single-key map, with every
+  element a non-empty **string**. The first version here declared objects with
+  `file` / `alt` / `caption`, so the declaration was rejected and the probe fell
+  back to the registry-side legacy file — which this plugin has no entry in. The
+  result is *no screenshots at all*, not an error. The registry's reasoning is
+  sound (a broken picture must degrade the site, not block the build), but it
+  means the mistake surfaces as an absence nobody reports. There is no `alt`
+  field; do not invent one.
+- **`[datetime]` on a GitHub timestamp relabels the instant.** PowerShell applies
+  the machine's timezone to the cast, so `2026-09-24T16:25:16Z` prints as
+  "2026-09-25 00:25 UTC" on a UTC+8 box: the right duration, the wrong timestamp,
+  and a reader waits eight hours longer than they need to. Parse with
+  `AssumeUniversal -bor AdjustToUniversal` and do the arithmetic in UTC.
+
+Screenshots are declared in **our** repo's `screenshots.json`, beside
+`package.json`, because that is where storefronts look. Keeping the images and
+their manifest here rather than in the registry's data directory means updating
+them is a push, not a PR to someone else's repository.
+
