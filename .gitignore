@@ -36,4 +36,9 @@ home/
 .sandbox/diag-built.cjs
 .sandbox/probe-overlay.mjs
 
-.sandbox/commit-msg.txt
+# Scratch commit messages. Written to a file because `git commit -m` on Windows
+# mangles non-ASCII, and every message here quotes钉钉's own error codes.
+# A glob, not an exact filename: `commit-msg.txt` alone let
+# `commit-msg-040.txt` and `commit-msg-test.txt` through, and an accidental
+# `git add -A` committed one of them.
+.sandbox/commit-msg*.txt
