@@ -21,7 +21,12 @@
 # plugin's own sources avoid PowerShell text pipelines.
 
 param(
-  [switch]$CheckOnly
+  [switch]$CheckOnly,
+  # Open the PR before the 1-day age floor clears. The registry's CI checks repo
+  # age, so the check will be RED until the floor passes and then GREEN on its
+  # own -- CI re-runs on a schedule, so nothing needs to be pushed or reopened.
+  # Use this when the PR is ready and the only thing missing is time.
+  [switch]$SkipAgeBar
 )
 
 $ErrorActionPreference = 'Stop'
@@ -177,9 +182,15 @@ $age = $now - $created
 Write-Host ("  repo created {0:yyyy-MM-dd HH:mm} UTC -- {1:N1} hours old" -f $created, $age.TotalHours)
 if ($age.TotalHours -lt 24) {
   $remaining = 24 - $age.TotalHours
-  Write-Host ("  BARRED by the 1-day age floor -- clears in {0:N1} hours ({1:yyyy-MM-dd HH:mm} UTC)" -f $remaining, $created.AddDays(1)) -ForegroundColor Yellow
-  Write-Host '  The gate re-runs itself; no resubmission, push, or reopen is needed.' -ForegroundColor Yellow
-  if (-not $CheckOnly) { throw 'waiting for the age bar' }
+  if ($SkipAgeBar) {
+    Write-Host ("  BARRED by the 1-day age floor -- opens anyway at the operator's request, {0:N1} hours early" -f $remaining) -ForegroundColor Yellow
+    Write-Host '  The registry CI checks repo age, so its check will be RED until the floor clears' -ForegroundColor Yellow
+    Write-Host '  and then GREEN on its own -- CI re-runs on a schedule. Nothing to push or reopen.' -ForegroundColor Yellow
+  } else {
+    Write-Host ("  BARRED by the 1-day age floor -- clears in {0:N1} hours ({1:yyyy-MM-dd HH:mm} UTC)" -f $remaining, $created.AddDays(1)) -ForegroundColor Yellow
+    Write-Host '  The gate re-runs itself; no resubmission, push, or reopen is needed.' -ForegroundColor Yellow
+    if (-not $CheckOnly) { throw 'waiting for the age bar' }
+  }
 } else {
   Write-Host '  ok   past the 1-day age floor' -ForegroundColor Green
 }
@@ -335,50 +346,89 @@ if ($CheckOnly) {
 # 5. fork, add the one file, open the PR
 # ------------------------------------------------------------------------- *
 Step 'fork'
-& gh repo fork $Upstream --clone=false 2>&1 | Out-Null
+# `gh repo fork` reports "already exists" on STDERR when the fork is already
+# there -- which is the normal case on a second run. With
+# $ErrorActionPreference = 'Stop' PowerShell turns ANY stderr line from a native
+# command into a terminating NativeCommandError, so the fork step aborted on the
+# run that actually mattered, before the outcome could be inspected. Drop the
+# preference to Continue around the call and decide on the result instead.
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+  $forkOut = & gh repo fork $Upstream --clone=false 2>&1
+  $forkCode = $LASTEXITCODE
+} finally {
+  $ErrorActionPreference = $prevEap
+}
+if ($forkCode -ne 0 -and ("$forkOut" -notmatch 'already exists')) {
+  throw "gh repo fork failed: $($forkOut -join ' | ')"
+}
 $login = & gh api user --jq .login
 Write-Host "  ok   fork ready as $login"
 
 Step 'the branch'
 $scratch = Join-Path $env:TEMP 'awesome-submit'
 if (Test-Path $scratch) { Remove-Item $scratch -Recurse -Force }
-& git clone --depth 1 --branch main "https://github.com/$Upstream.git" $scratch 2>&1 | Out-Null
-Push-Location $scratch
+
+# Every git and gh call below writes progress to stderr, and with
+# $ErrorActionPreference = 'Stop' PowerShell turns each of those lines into a
+# terminating NativeCommandError. This whole block therefore ran under
+# 'Continue' -- the pre-flight half of the script already did this per call, but
+# the submission half never got the treatment because it was never reached past
+# the fork step, which is where it first died. Failures are detected by checking
+# the artefact afterwards, which is the only thing that was ever trustworthy.
+$ErrorActionPreference = 'Continue'
 try {
-  & git remote add fork "https://github.com/$login/awesome-dsh-plugin.git"
-  & git checkout -q -b $Branch
+  & git clone --depth 1 --branch main "https://github.com/$Upstream.git" $scratch 2>&1 | Out-Null
+  if (-not (Test-Path (Join-Path $scratch 'data\plugins'))) { throw "could not clone the registry into $scratch" }
+  Write-Host '  ok   upstream main cloned'
 
-  # The one file the guide asks for. Nothing else is touched: the two READMEs
-  # are generated from data/plugins/*.yml on main after the merge, and editing
-  # them by hand is exactly what the guide says not to do.
-  New-Item -ItemType Directory -Path 'data\plugins' -Force | Out-Null
-  Copy-Item $Entry "data\plugins\$EntryName"
+  Push-Location $scratch
+  try {
+    & git remote add fork "https://github.com/$login/awesome-dsh-plugin.git" 2>&1 | Out-Null
+    & git checkout -q -b $Branch 2>&1 | Out-Null
 
-  & git add "data/plugins/$EntryName"
-  # The noreply address rather than a real one: this commit lands in a public
-  # repository, so whatever email is configured here becomes public with it.
-  $email = "$login@users.noreply.github.com"
-  & git -c user.name=$login -c user.email=$email commit -q -m 'Add dsh-notify-relay to Notifications and Integrations'
+    # The one file the guide asks for. Nothing else is touched: the two READMEs
+    # are generated from data/plugins/*.yml on main after the merge, and editing
+    # them by hand is exactly what the guide says not to do.
+    New-Item -ItemType Directory -Path 'data\plugins' -Force | Out-Null
+    Copy-Item $Entry "data\plugins\$EntryName"
 
-  # --force, and here is why it is safe. The branch is rebuilt from upstream
-  # main on every run, so a second run -- a retry after a failure, or this
-  # script having already been dry-run -- produces a commit that is NOT a
-  # descendant of what is already on the fork. A plain push is then rejected:
-  #   ! [rejected] add-dsh-notify-relay -> add-dsh-notify-relay (fetch first)
-  # Reproduced by running the submission path twice.
-  #
-  # --force-with-lease does not fix it either: the scratch clone is
-  # `--depth 1 --branch main` with the fork remote added seconds earlier, so
-  # there is no remote-tracking ref to lease against and git answers
-  # "(stale info)". Fetching first would work but buys nothing -- the lease
-  # protects a branch whose history matters, and this one is a script-owned
-  # artifact whose entire content is "upstream main plus one added file",
-  # regenerated from scratch every run. Declaring that is what --force means.
-  & git push -q --force fork $Branch
-  Write-Host '  ok   branch pushed'
+    & git add "data/plugins/$EntryName" 2>&1 | Out-Null
+    # The noreply address rather than a real one: this commit lands in a public
+    # repository, so whatever email is configured here becomes public with it.
+    $email = "$login@users.noreply.github.com"
+    & git -c user.name=$login -c user.email=$email commit -q -m 'Add dsh-notify-relay to Notifications and Integrations' 2>&1 | Out-Null
+    $committed = & git rev-parse --verify HEAD 2>&1
+    if (-not $committed) { throw 'the entry was not committed' }
+    Write-Host "  ok   entry committed as $($committed.Substring(0,7))"
 
-  Step 'the pull request'
-  & gh pr create --repo $Upstream --base main --head "$login`:$Branch" --title 'Add dsh-notify-relay' --body $script:PrBody
+    # --force, and here is why it is safe. The branch is rebuilt from upstream
+    # main on every run, so a second run -- a retry after a failure, or this
+    # script having already been dry-run -- produces a commit that is NOT a
+    # descendant of what is already on the fork. A plain push is then rejected:
+    #   ! [rejected] add-dsh-notify-relay -> add-dsh-notify-relay (fetch first)
+    # Reproduced by running the submission path twice.
+    #
+    # --force-with-lease does not fix it either: the scratch clone is
+    # `--depth 1 --branch main` with the fork remote added seconds earlier, so
+    # there is no remote-tracking ref to lease against and git answers
+    # "(stale info)". Fetching first would work but buys nothing -- the lease
+    # protects a branch whose history matters, and this one is a script-owned
+    # artifact whose entire content is "upstream main plus one added file",
+    # regenerated from scratch every run. Declaring that is what --force means.
+    & git push -q --force fork $Branch 2>&1 | Out-Null
+    $remote = & git ls-remote fork "refs/heads/$Branch" 2>&1
+    if (-not $remote) { throw "branch $Branch did not reach the fork" }
+    Write-Host '  ok   branch pushed'
+
+    Step 'the pull request'
+    $prOut = & gh pr create --repo $Upstream --base main --head "$login`:$Branch" --title 'Add dsh-notify-relay' --body $script:PrBody 2>&1
+    if (-not $prOut) { throw 'gh pr create produced no URL' }
+    Write-Host "  ok   $prOut"
+  } finally {
+    Pop-Location
+  }
 } finally {
-  Pop-Location
+  $ErrorActionPreference = 'Stop'
 }
