@@ -1906,6 +1906,121 @@ async function probeOutbox({ variantMod, scratch, makeCtx }) {
  * ------------------------------------------------------------------ */
 
 /**
+ * Boots a variant in COMPLETE isolation and drives one failing DingTalk
+ * delivery, then forces the retry past 钉钉's one-hour signature window.
+ *
+ * This is deliberately not a section inside probeFeatures. The first attempt
+ * put it there and it reported a re-signed retry for a build whose cache had in
+ * fact hit, because:
+ *
+ *   1. DingTalk's sign depends ONLY on (timestamp, secret) — never on the body.
+ *      So a leftover delivery from an earlier section, still in flight, carries
+ *      a byte-identical sign and is indistinguishable by content.
+ *   2. `sent` is a shared array across every section, and an async delivery
+ *      from the breaker section landed in the window this probe was reading.
+ *
+ * Filtering by a unique token fixed neither, because the leftover was sent to
+ * the SAME reconfigured channel. Only a fresh module boot in its own scratch
+ * removes the cross-talk, which is what this does.
+ *
+ * `reusedSign: true` means the BUG — the retry carried the first attempt's sign.
+ */
+async function probeDingtalkRetry({ variantMod, scratch, makeCtx }) {
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = scratch
+
+  const routes = []
+  const handlers = new Map()
+  const table = new Map()
+  const sent = []
+  let failNext = true
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), init })
+    return failNext ? { ok: false, status: 503 } : { ok: true, status: 200 }
+  }
+
+  const webServer = {
+    register(route) {
+      if (table.has(route.path)) throw new Error(`duplicate route: ${route.path}`)
+      table.set(route.path, route)
+      routes.push(route)
+      return () => {}
+    },
+  }
+  const webCtx = makeCtx(['webServer'], { webServer })
+  const timer = { timeout: () => () => {}, interval: () => () => {} }
+  const ctx = makeCtx(variantMod.inject, {
+    commands: { register: () => () => {} },
+    timer,
+    timeout: timer.timeout,
+    interval: timer.interval,
+  })
+  Object.defineProperty(ctx, 'on', { value: (event, handler) => (handlers.set(event, handler), () => {}), configurable: true })
+  Object.defineProperty(ctx, 'inject', { value: (s, cb) => (typeof cb === 'function' && cb(webCtx), () => {}), configurable: true })
+
+  const settle = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+  const realNow = Date.now
+  let clock = 1700000000000
+  Date.now = () => clock
+
+  try {
+    await variantMod.apply(ctx)
+    const configRoute = routes.find((route) => route.path === '/notify-relay/config')
+    if (!configRoute) return { booted: false, reusedSign: false, detail: 'no config route' }
+    await callRoute(configRoute, {
+      method: 'POST',
+      body: {
+        config: {
+          enabled: true,
+          language: 'en',
+          events: { 'task.failed': true },
+          dedup: { windowMinutes: 0 },
+          quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
+          digest: { enabled: false, intervalMinutes: 30 },
+          channels: [{ id: 'dt', kind: 'dingtalk', secrets: { token: 'TK', secret: 'SEC' }, enabled: true, events: ['*'] }],
+        },
+      },
+    })
+
+    const agentListener = handlers.get('agent/error')
+    if (!agentListener) return { booted: false, reusedSign: false, detail: 'no agent/error listener' }
+    await agentListener({ sessionId: 'dt-1', title: 'dt-1', detail: 'boom' })
+    await settle(300)
+
+    const first = sent.find((entry) => entry.url.includes('oapi.dingtalk.com'))
+    if (!first) return { booted: true, reusedSign: false, detail: 'the first attempt never reached the wire' }
+    const firstTs = new URL(first.url).searchParams.get('timestamp')
+
+    /* Past DingTalk's window, then force the retry. */
+    clock = 1700003600000
+    const retryRoute = routes.find((route) => route.path === '/notify-relay/retry')
+    if (!retryRoute) return { booted: true, reusedSign: false, detail: 'no retry route' }
+    await callRoute(retryRoute, { method: 'POST', body: {} })
+    await settle(300)
+
+    const attempts = sent.filter((entry) => entry.url.includes('oapi.dingtalk.com'))
+    if (attempts.length < 2) {
+      return { booted: true, reusedSign: false, detail: `expected a retry on the wire, saw ${attempts.length} attempt(s)` }
+    }
+    const retryTs = new URL(attempts[attempts.length - 1].url).searchParams.get('timestamp')
+    const reused = firstTs === retryTs
+    return {
+      booted: true,
+      reusedSign: reused,
+      detail: `${attempts.length} attempt(s); first ts=${firstTs}; retry ts=${retryTs}`,
+    }
+  } catch (error) {
+    return { booted: true, reusedSign: false, detail: `threw: ${error && error.message}` }
+  } finally {
+    Date.now = realNow
+    globalThis.fetch = realFetch
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+}
+
+/**
  * Broken-build variants. Each one must be REJECTED by the gate, and each
  * declares its own predicate so a variant that fails for the wrong reason (a
  * crash in the harness itself) is not mistaken for a catch.
@@ -2101,6 +2216,27 @@ async function testVariants(mod, originalSource) {
       probe: probeFeatures,
       expect: ({ probe }) => probe && probe.heartbeatGated === true,
     },
+    {
+      /* The DingTalk retry reuses the request built for the first attempt.
+         钉钉 rejects a sign older than an hour, so every retry after that window
+         fails — and it fails on an HTTP 200 carrying errcode 310000, which reads
+         as a network problem and is not one. Caching the built request is exactly
+         the kind of "optimisation" that looks harmless and silently kills the
+         retry path. */
+      label: 'the DingTalk retry reuses the first attempt\u2019s signature',
+      mutate: (source) =>
+        source
+          .replace(
+            /  const built = buildDelivery\(channel, notification, started\)\r?\n/,
+            '  const _k = notification.kind + "|" + notification.title\n  const built = buildDeliveryCache.get(_k) || buildDelivery(channel, notification, started)\n  buildDeliveryCache.set(_k, built)\n',
+          )
+          .replace(
+            /const breakers = new Map\(\)/,
+            'const breakers = new Map()\nconst buildDeliveryCache = new Map()',
+          ),
+      probe: probeDingtalkRetry,
+      expect: ({ probe }) => probe && probe.reusedSign === true,
+    },
   ]
 
   const dir = path.join(path.dirname(path.resolve(file)), '.sandbox')
@@ -2214,6 +2350,30 @@ async function main() {
   testBuildDelivery(mod)
   testSeverity(mod)
   testDingtalkSign(mod)
+  /* The one DingTalk property that cannot be asserted on a pure function: that
+     the RETRY path re-signs. buildDelivery is pure and re-signs correctly, but
+     drainOutbox could still reuse a request built for the first attempt, and
+     钉钉 rejects a sign older than an hour — so the retry would fail on a 200
+     carrying errcode 310000, forever, looking like a network fault.
+
+     Runs in its own isolated boot, not as a section of probeFeatures: DingTalk's
+     sign depends only on (timestamp, secret), so an in-flight delivery from an
+     earlier section carries a byte-identical sign and cannot be told apart by
+     content. */
+  {
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-notify-good-'))
+    const probe = await probeDingtalkRetry({ variantMod: mod, scratch, makeCtx })
+    /* label first, condition second. The first version of this call had them
+       swapped, which made the label the boolean `true` and the condition the
+       label string -- always truthy, so the gate reported "ok true" and passed
+       for a reason that had nothing to do with DingTalk. */
+    check(
+      'a DingTalk retry is signed with the retry clock, not the first attempt',
+      probe && probe.reusedSign === false,
+      probe ? probe.detail : 'the probe did not boot',
+    )
+    fs.rmSync(scratch, { recursive: true, force: true })
+  }
   testDeepLink(mod)
   testBackoffJitter(mod)
   testBreaker(mod)
