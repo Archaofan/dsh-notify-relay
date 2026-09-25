@@ -4,7 +4,7 @@
  * the plugin that a user can falsify in thirty seconds by installing it. The
  * registry's CI checks the YAML SHAPE -- allowed keys, parseable, README
  * regenerates -- and nothing about whether the description is true. So this
- * checks the claims, against the actual v0.4.1 tarball rather than the working
+ * checks the claims, against the actual v0.4.2 tarball rather than the working
  * tree, because the tarball is what the entry points at.
  */
 const { execFileSync } = require('node:child_process')
@@ -12,7 +12,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
-const TARBALL = 'https://github.com/Archaofan/dsh-notify-relay/releases/download/v0.4.1/dsh-notify-relay-0.4.1.tgz'
+const TARBALL = 'https://github.com/Archaofan/dsh-notify-relay/releases/download/v0.4.2/dsh-notify-relay-0.4.2.tgz'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claim-audit-'))
 const tgz = path.join(tmp, 'r.tgz')
@@ -61,7 +61,7 @@ function countInBlock(source, header) {
   return [...new Set(ids)]
 }
 
-console.log("=== the marketplace entry's claims, against the shipped v0.4.1 ===\n")
+console.log("=== the marketplace entry's claims, against the shipped v0.4.2 ===\n")
 
 /* 1. "eight DSH lifecycle events" */
 const events = countInBlock(index, 'EVENT_KINDS') || []
