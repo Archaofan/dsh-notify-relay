@@ -89,6 +89,41 @@ dependencies, so refusing to run them is both faster and safer.
 After installing, restart DSH (or reload the web app) and open
 Settings → **Outbound relay**.
 
+### If the second install fails with `ERR_PNPM_MISSING_TARBALL_INTEGRITY`
+
+This is a pnpm bug, not a plugin one, and it reproduces in plain `pnpm` with no
+DSH involved:
+
+```bash
+$ pnpm add https://github.com/Archaofan/dsh-notify-relay/releases/download/v0.3.3/dsh-notify-relay-0.3.3.tgz
+# ok, but the lockfile records `resolution: {tarball: ...}` with NO integrity
+$ pnpm add <any-other-package>
+ERR_PNPM_MISSING_TARBALL_INTEGRITY  Cannot install package "dsh-notify-relay@...":
+its lockfile entry has no "integrity" field, so pnpm cannot verify the tarball.
+```
+
+When pnpm serves a tarball from its content-addressable store rather than
+downloading it, it writes the lockfile entry without an integrity field. The
+install that caused it succeeds; the *next* install in that profile then refuses
+to run, because pnpm will not install a tarball it cannot verify.
+
+**The first install always works.** So this only bites when you add a second
+plugin to a profile that already carries one.
+
+To clear it, delete both files and reinstall — deleting only the lockfile does
+**not** work, because pnpm regenerates it from `package.json` and the store is
+still warm:
+
+```bash
+# <DSH_HOME>/profiles/<profile>/
+rm -rf node_modules pnpm-lock.yaml
+dsh plugin --profile web add file:./dsh-notify-relay-0.3.3.tgz --ignore-scripts
+```
+
+`pnpm store prune`, `pnpm add --force`, and pointing at a cold `--store-dir`
+were all tested and none of them clear it once `node_modules` still holds the
+package.
+
 ## Configure
 
 The fastest path is the settings page. If you prefer to seed the file directly,
@@ -314,6 +349,26 @@ node .sandbox/gate.cjs        # both harnesses, both languages, plus variants
 
 Both harnesses run once per language, because a build that only materializes in
 Chinese proves nothing about the English UI.
+
+### The releases were e2e'd too, not inferred
+
+v0.3.3 and v0.2.5 ship the same `index.js` and `client.js` bytes as the versions
+before them, so it would have been reasonable to argue that a browser re-run
+"would test the same bytes". That is an inference, and inferences are what gates
+exist to replace. `.sandbox/verify-e2e-releases.cjs` runs the browser half of
+**both** plugins against a **real GUI**, on **both** runtimes:
+
+| Runtime | notify-relay v0.3.3 | session-suspend v0.2.5 |
+| --- | --- | --- |
+| DSH 0.1.6-alpha.2 | 28 checks, 0 failures | 19 checks, 0 failures |
+| DSH 0.1.7-rc.2 | 28 checks, 0 failures | 7 checks, 0 failures |
+
+Both plugins **activate** (no "did not activate"), raise **no page error and no
+console error**, render their pill / sidebar rows, render the official settings
+section, and a change made in the UI **round-trips through to the host**. The
+session-suspend row count is lower on 0.1.7 because that profile is fresh and
+holds only the empty draft — the hover chain needs a parked session to measure
+against, and it skips itself rather than passing vacuously.
 
 ### Bugs the gates only caught because they were built to fail
 

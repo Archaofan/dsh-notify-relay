@@ -80,6 +80,37 @@ dsh plugin --profile web add file:./dsh-notify-relay-0.3.3.tgz --ignore-scripts
 
 装完重启 DSH（或重新加载 web 应用），进入 设置 → **外联中枢**。
 
+### 如果第二次安装报 `ERR_PNPM_MISSING_TARBALL_INTEGRITY`
+
+这是 pnpm 的 bug，不是插件的问题，在完全不涉及 DSH 的纯 `pnpm` 里就能复现：
+
+```bash
+$ pnpm add https://github.com/Archaofan/dsh-notify-relay/releases/download/v0.3.3/dsh-notify-relay-0.3.3.tgz
+# 成功，但 lockfile 里写的是 `resolution: {tarball: ...}`，没有 integrity 字段
+$ pnpm add <随便另一个包>
+ERR_PNPM_MISSING_TARBALL_INTEGRITY  Cannot install package "dsh-notify-relay@...":
+its lockfile entry has no "integrity" field, so pnpm cannot verify the tarball.
+```
+
+pnpm 从内容寻址的 store 里直接取 tarball（而不是重新下载）时，写进 lockfile 的
+条目会缺 integrity 字段。触发它的那次安装是成功的；**同一 profile 里的下一次
+安装**才会被拒绝，因为 pnpm 不肯安装一个无法校验的 tarball。
+
+**第一次安装总是成功的。** 所以这只在"往已经装了一个插件的 profile 里再装一个"
+时才咬人。
+
+清掉它要同时删两个文件——只删 lockfile **没用**，pnpm 会从 `package.json` 重新
+生成，而 store 还是热的：
+
+```bash
+# <DSH_HOME>/profiles/<profile>/
+rm -rf node_modules pnpm-lock.yaml
+dsh plugin --profile web add file:./dsh-notify-relay-0.3.3.tgz --ignore-scripts
+```
+
+`pnpm store prune`、`pnpm add --force`、以及换一个冷的 `--store-dir` 都测过，
+只要 `node_modules` 里还留着那个包，没有一个能清掉它。
+
 ## 配置
 
 最快的路径是设置页。想直接写文件的话，配置在
@@ -273,6 +304,24 @@ node .sandbox/gate.cjs        # 两个 harness，两种语言，外加全部变�
 ```
 
 两个 harness 都按语言各跑一遍——只在中文下能物化的构建，证明不了英文界面任何事。
+
+### 发布版也真跑了 e2e，不是推断出来的
+
+v0.3.3 与 v0.2.5 的 `index.js` / `client.js` 和上一版逐字节相同，所以"再跑一遍
+浏览器测的也是同样的字节"听起来是个正当理由。但那是推断，而门禁存在的意义正是
+把推断换掉。`.sandbox/verify-e2e-releases.cjs` 把**两个**插件的浏览器面都打到
+**真实 GUI** 上，覆盖**两条**运行时：
+
+| 运行时 | notify-relay v0.3.3 | session-suspend v0.2.5 |
+| --- | --- | --- |
+| DSH 0.1.6-alpha.2 | 28 项检查，0 失败 | 19 项检查，0 失败 |
+| DSH 0.1.7-rc.2 | 28 项检查，0 失败 | 7 项检查，0 失败 |
+
+两个插件都**激活成功**（没有 "did not activate"）、**不抛 page error、不抛
+console error**、状态胶囊 / 侧边栏行正常渲染、官方设置分区正常渲染，且界面上一次
+修改能**穿透回 host**。session-suspend 在 0.1.7 上检查项更少，是因为那个 profile
+是新建的、只有一个空草稿——hover 链路需要一个已停放的会话来比对，它选择跳过而
+不是空跑通过。
 
 ### 只有"会失败的门禁"才抓到的 bug
 
