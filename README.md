@@ -351,8 +351,8 @@ all of which must pass, and three of which are designed to **fail**:
 
 | Gate | What it proves |
 | --- | --- |
-| `.sandbox/host-harness.cjs` | The fail-loud inject contract, the rule engine (dedup / quiet hours / severity mapping / payload builders / redaction), a **real HTTP delivery** to a loopback server, the deep link on the wire, the breaker state machine, the durable outbox (enqueue / backoff / retry / give-up / restart recovery), and **16 broken-build variants** |
-| `.sandbox/client-harness.cjs` | Materialization against a strict fake ctx, the inject contract, the settings-section thunk label across a language switch, dictionary key parity, the editor round-trip, **event-vocabulary parity with the host**, and 4 broken variants |
+| `.sandbox/host-harness.cjs` | The fail-loud inject contract, the rule engine (dedup / quiet hours / severity mapping / payload builders / redaction), a **real HTTP delivery** to a loopback server, the deep link on the wire, the breaker state machine, the durable outbox (enqueue / backoff / retry / give-up / restart recovery), and **17 broken-build variants** |
+| `.sandbox/client-harness.cjs` | Materialization against a strict fake ctx, the inject contract, the settings-section thunk label across a language switch, dictionary key parity, the editor round-trip, **event-vocabulary parity with the host**, **channel-vocabulary parity with the host**, and 5 broken variants |
 | `.sandbox/live-check.cjs` | The plugin **booted inside a real DSH**: config write → read-back → real socket delivery → log → reset → `/retry` → delivery language |
 | `.sandbox/e2e-notify.mjs` | The browser half in a **real GUI**: pill, delivery panel, official settings section, and a UI change that round-trips through the host |
 

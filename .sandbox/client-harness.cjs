@@ -769,6 +769,32 @@ async function main() {
     }
   }
 
+  /* ---- the channel vocabulary must match the host, id for id ----
+
+     The count check above passes on a typo. If the client offers `dingtak`, the
+     picker still shows eight options, the config still round-trips, and the
+     host's validateConfig DROPS the channel as an unknown kind — so the user
+     saves a channel and it silently disappears. Both halves were internally
+     consistent, which is why nothing caught it.
+
+     This is the same disagreement the event check above catches, applied to
+     channels, where the failure mode is worse: an event mismatch is visible in
+     the UI, a channel mismatch deletes the user's configuration. */
+  const clientChannelIds = clientExports.__test__ ? clientExports.__test__.ids.channels : null
+  check('the client exposes its channel list for comparison', Array.isArray(clientChannelIds), String(clientChannelIds))
+  if (Array.isArray(clientChannelIds)) {
+    const hostChannelIds = hostModule.CHANNEL_KINDS.map((kind) => kind.id)
+    check(
+      'the client channel list matches the host CHANNEL_KINDS exactly',
+      clientChannelIds.length === hostChannelIds.length && clientChannelIds.every((id, index) => id === hostChannelIds[index]),
+      `client=[${clientChannelIds.join(',')}] host=[${hostChannelIds.join(',')}]`,
+    )
+    /* The reverse direction matters more: a kind the host can build but the
+       client cannot offer is a channel the user can never configure. */
+    const hostOnly = hostChannelIds.filter((id) => !clientChannelIds.includes(id))
+    check('the client offers every channel the host can build', hostOnly.length === 0, hostOnly.join(','))
+  }
+
   /* ---- the observability surface ----
 
      The most common complaint about notification plugins in this ecosystem is
@@ -895,6 +921,21 @@ async function main() {
       mutate: (src) => src.replace("const inject = ['slots', 'locale']", "const inject = ['slots']"),
       expect: (state) => state.threw && /without inject/.test(state.threw.message),
     },
+    {
+      /* A channel kind the host cannot build. The picker still shows eight
+         options and the config still round-trips, so nothing looks wrong — but
+         validateConfig drops an unknown kind, so the user's channel silently
+         disappears on save. The count-only check passes on this; only an
+         id-for-id comparison catches it. */
+      label: 'a channel kind the host cannot build',
+      mutate: (src) => src.replace("id: 'dingtalk'", "id: 'dingtak'"),
+      expect: (state) => {
+        const channels = state.exports && state.exports.__test__ && state.exports.__test__.ids.channels
+        const host = hostModule.CHANNEL_KINDS.map((kind) => kind.id)
+        if (!Array.isArray(channels)) return false
+        return !(channels.length === host.length && channels.every((id, index) => id === host[index]))
+      },
+    },
   ]
 
   for (const variant of variants) {
@@ -935,7 +976,7 @@ async function main() {
 
     /* A fresh fake ctx with its own registration list, so the variant's
        behaviour is observed rather than inferred. */
-    const state = { registered: [], dicts: localeDicts, threw: null }
+    const state = { registered: [], dicts: localeDicts, threw: null, exports: variantExports }
     const variantServices = {
       slots: {
         register(descriptor, component) {

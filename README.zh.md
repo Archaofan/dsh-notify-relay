@@ -304,8 +304,8 @@ send         立即投递
 
 | 门禁 | 证明了什么 |
 | --- | --- |
-| `.sandbox/host-harness.cjs` | fail-loud 的 inject 契约、规则引擎（去重 / 免打扰 / 严重度映射 / payload 构造 / 脱敏）、**一次打到回环服务器的真实 HTTP 投递**、深链在真实请求里落地、熔断状态机、持久化 outbox 的入队 / 退避 / 重试 / 放弃 / 重启恢复，**16 个坏构建变体** |
-| `.sandbox/client-harness.cjs` | 在严格假 ctx 下物化、inject 契约、设置页导航标签随语言切换、字典键对齐、编辑器完整往返、**事件词表与 host 逐项对齐**，4 个坏变体 |
+| `.sandbox/host-harness.cjs` | fail-loud 的 inject 契约、规则引擎（去重 / 免打扰 / 严重度映射 / payload 构造 / 脱敏）、**一次打到回环服务器的真实 HTTP 投递**、深链在真实请求里落地、熔断状态机、持久化 outbox 的入队 / 退避 / 重试 / 放弃 / 重启恢复，**17 个坏构建变体** |
+| `.sandbox/client-harness.cjs` | 在严格假 ctx 下物化、inject 契约、设置页导航标签随语言切换、字典键对齐、编辑器完整往返、**事件词表与 host 逐项对齐**、**通道词表与 host 逐项对齐**，5 个坏变体 |
 | `.sandbox/live-check.cjs` | 插件**在真实 DSH 里启动**：写配置 → 读回 → 真实 socket 投递 → 日志 → 复位 → `/retry` → 外发语言 |
 | `.sandbox/e2e-notify.mjs` | 浏览器面在**真实 GUI** 里：状态胶囊、投递面板、官方设置分区、以及一次从界面穿透到 host 的修改 |
 

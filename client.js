@@ -103,7 +103,11 @@ window.__ModuleLoader__.load({
       },
     ]
 
-    const CHANNEL_KIND_IDS = new Set(CHANNEL_KINDS.map((c) => c.id))
+    /* An array, like EVENT_IDS, not a Set. The two lists are exposed together on
+       the same test surface and a harness comparing them has to know which shape
+       to expect; the first version of the channel check read this as an array
+       and reported "[object Set]". */
+    const CHANNEL_KIND_IDS = CHANNEL_KINDS.map((c) => c.id)
 
     /** Sentinel the host sends instead of a real secret (must match index.js). */
     const REDACTED = '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022'
@@ -485,7 +489,7 @@ window.__ModuleLoader__.load({
     /** Coerce one host channel into a shape this editor can render. */
     function normalizeChannel(raw) {
       if (!raw || typeof raw !== 'object') return null
-      const kind = CHANNEL_KIND_IDS.has(raw.kind) ? raw.kind : 'webhook'
+      const kind = CHANNEL_KIND_IDS.includes(raw.kind) ? raw.kind : 'webhook'
       const spec = CHANNEL_KINDS.find((c) => c.id === kind)
       const secrets = {}
       for (const field of spec.fields) {
