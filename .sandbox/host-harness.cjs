@@ -1968,6 +1968,149 @@ async function probeOutbox({ variantMod, scratch, makeCtx }) {
  * ------------------------------------------------------------------ */
 
 /**
+ * Boots a fresh module, holds one event, then changes the digest interval and
+ * reports the delay the timer was actually armed with afterwards.
+ *
+ * This is the "string captured at creation" class, applied to a timer.
+ * `armDigest` early-returns when a timer is already armed, so the config
+ * route's `armDigest()` call is a no-op while events are held: the user changes
+ * "every 30 minutes" to "every 5", saves, and the pending digest still fires on
+ * the old schedule. The setting looks saved, because it is — it just does not
+ * take effect until the next flush re-arms from scratch, which for a 30-minute
+ * interval means up to half an hour of "I asked for five".
+ *
+ * `rescheduled` is true only when the second arming genuinely used the new
+ * interval, so a probe that never reaches the second POST cannot pass it.
+ */
+async function probeDigestReschedule({ variantMod, scratch, makeCtx }) {
+  /* Own storage, and restored afterwards. Without this, `loadConfig()` on boot
+     reads whatever the PREVIOUS run persisted to the default DSH_HOME — which is
+     why this check passed when the harness was run alone and failed when gate.cjs
+     ran it a second time in the other language: the first run's saved config was
+     still on disk, and its digest interval armed a timer that had nothing held
+     behind it. Same isolation probeDingtalkRetry already does. */
+  const previousHome = process.env.DSH_HOME
+  process.env.DSH_HOME = scratch
+
+  const routes = []
+  const handlers = new Map()
+  const table = new Map()
+  const timers = []
+  const sent = []
+  let clock = 1700000000000
+  const realNow = Date.now
+  const realFetch = globalThis.fetch
+
+  const webServer = {
+    register(route) {
+      if (table.has(route.path)) throw new Error(`duplicate route: ${route.path}`)
+      table.set(route.path, route)
+      routes.push(route)
+      return () => {}
+    },
+  }
+  const webCtx = makeCtx(['webServer'], { webServer })
+  const timer = {
+    timeout(fn, ms) {
+      timers.push({ ms, fn, armedAt: clock })
+      return () => {}
+    },
+    interval: () => () => {},
+  }
+  const ctx = makeCtx(variantMod.inject, {
+    commands: { register: () => () => {} },
+    timer,
+    timeout: timer.timeout,
+    interval: timer.interval,
+  })
+  Object.defineProperty(ctx, 'on', { value: (event, handler) => (handlers.set(event, handler), () => {}), configurable: true })
+  Object.defineProperty(ctx, 'inject', { value: (s, cb) => (typeof cb === 'function' && cb(webCtx), () => {}), configurable: true })
+
+  Date.now = () => clock
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), init })
+    return { ok: true, status: 200 }
+  }
+
+  try {
+    await variantMod.apply(ctx)
+    const configRoute = routes.find((route) => route.path === '/notify-relay/config')
+    const agentListener = handlers.get('agent/error')
+    if (!configRoute || !agentListener) return { booted: false, rescheduled: false, detail: 'no config route or agent listener' }
+
+    const post = async (intervalMinutes) => {
+      await callRoute(configRoute, {
+        method: 'POST',
+        body: {
+          config: {
+            enabled: true,
+            language: 'en',
+            events: { 'task.failed': true },
+            dedup: { windowMinutes: 0 },
+            quiet: { enabled: false, start: '22:00', end: '08:00', mode: 'digest' },
+            digest: { enabled: true, intervalMinutes },
+            channels: [{ id: 'bk', kind: 'bark', secrets: { key: 'BK' }, enabled: true, events: ['*'] }],
+          },
+        },
+      })
+    }
+
+    /* 30 minutes first, then hold one event so the digest timer is armed on it. */
+    await post(30)
+    await agentListener({ sessionId: 'rs-1', title: 'rs-1', detail: 'boom' })
+
+    /* Ask for five, then advance the clock six minutes: past the interval the
+       user just asked for, short of the one they replaced. */
+    await post(5)
+    /* And the queue must still hold what it held. `disarmDigest` empties
+       `digestQueue`, so the obvious way to write the retime fix — dispose, then
+       re-arm — silently drops every batched notification on the save that was
+       meant to reschedule their delivery. That is what the first version of the
+       fix did, and it passed every other check while doing it. */
+    const heldAfter = await callRoute(configRoute, { method: 'GET' })
+    const heldCount = heldAfter && heldAfter.body ? Number(heldAfter.body.held) : -1
+
+    clock += 6 * 60_000
+    const due = timers.filter((entry) => entry.armedAt + entry.ms <= clock)
+    for (const entry of due) entry.fn()
+    /* The delivery is fire-and-forget by design, so the wire is only populated
+       after the microtasks turn. */
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    /* The digest, and only the digest. The outbox timer fires in the same window
+       and its `reportDegraded()` sends a self-monitor warning through the same
+       `events: ['*']` channel, so "did anything reach Bark" is not a verdict —
+       the first version of this check used exactly that and passed the broken
+       build, because the degraded report arrived on schedule while the digest
+       was still waiting on the old 30. The digest is the payload whose body
+       carries the bullet list of held items. */
+    const digestWire = sent.filter((entry) => entry.url.includes('api.day.app/BK')).find((entry) => {
+      try {
+        return String(JSON.parse(String(entry.init.body)).body).includes('\u2022 rs-1')
+      } catch {
+        return false
+      }
+    })
+
+    return {
+      booted: true,
+      dueCount: due.length,
+      delivered: sent.length,
+      heldCount,
+      flushed: !!digestWire,
+      rescheduled: !!digestWire && heldCount > 0,
+    }
+  } catch (error) {
+    return { booted: false, rescheduled: false, detail: error.message }
+  } finally {
+    Date.now = realNow
+    globalThis.fetch = realFetch
+    if (previousHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previousHome
+  }
+}
+
+/**
  * Boots a variant in COMPLETE isolation and drives one failing DingTalk
  * delivery, then forces the retry past 钉钉's one-hour signature window.
  *
@@ -2271,6 +2414,33 @@ async function testVariants(mod, originalSource) {
       expect: ({ probe }) => probe && probe.digestDelivered === true && probe.digestLevel !== 'timeSensitive',
     },
     {
+      /* The interval-rescheduling regression: `armDigest` early-returns on an
+         armed timer, so a config save that merely calls `armDigest()` leaves the
+         pending flush on the interval that was current when the first event
+         arrived. The user retimes 30 -> 5, saves, and still waits the half hour.
+         The setting IS stored correctly, which is what makes it hard to see. */
+      label: 'the digest interval does not take effect until the next flush',
+      mutate: (source) =>
+        source.replace(
+          '              rearmDigest()',
+          '              armDigest()',
+        ),
+      probe: probeDigestReschedule,
+      expect: ({ probe }) => probe && probe.booted === true && probe.rescheduled === false,
+    },
+    {
+      /* The regression the retime fix itself introduced, one revision later.
+         `disarmDigest` empties the held queue, so "dispose, then re-arm" drops
+         every batched notification on the save that was meant to reschedule
+         their delivery. The timer is correctly retimed and the user gets
+         nothing at all — which passes every check that only looks at the wire
+         after the flush, because there is no flush to look at. */
+      label: 'retiming the digest drops the held queue',
+      mutate: (source) => source.replace('              rearmDigest()', '              disarmDigest()\n              armDigest()'),
+      probe: probeDigestReschedule,
+      expect: ({ probe }) => probe && probe.booted === true && probe.heldCount === 0,
+    },
+    {
       /* A notifier that quietly stops notifying is strictly worse than no
          notifier, because the user believes they are covered. This is the one
          variant whose absence costs the user the most and whose presence is
@@ -2286,7 +2456,7 @@ async function testVariants(mod, originalSource) {
          nothing has an empty queue by definition. */
       label: 'the heartbeat re-arms only while work is pending',
       mutate: (source) =>
-        source.replace(/      if \(config\.enabled\) armOutboxTimer\(delay\)/, '      if (outbox.length > 0) armOutboxTimer(delay)'),
+        source.replace(/      if \(config\.enabled\) armOutboxTimer\(digestIntervalMs\(\)\)/, '      if (outbox.length > 0) armOutboxTimer(digestIntervalMs())'),
       probe: probeFeatures,
       expect: ({ probe }) => probe && probe.heartbeatGated === true,
     },
@@ -2318,7 +2488,13 @@ async function testVariants(mod, originalSource) {
   for (const variant of variants) {
     const mutated = variant.mutate(originalSource)
     if (mutated === originalSource) {
-      console.log(`  skip ${variant.label} (pattern no longer present)`)
+      /* A variant whose mutation no longer applies has silently stopped proving
+         anything, and "skip" is how that used to hide. Two of them — including
+         the one guarding the digest-interval regression fixed this round — went
+         quiet for several revisions because the source had been renamed around
+         them. Coverage that disappears without a red gate is not coverage. */
+      console.log(`  FAIL ${variant.label} — the mutation no longer applies to index.js, so this variant proves nothing`)
+      failures.push(variant.label)
       continue
     }
     const variantPath = path.join(dir, `variant-${Math.random().toString(36).slice(2, 8)}.mjs`)
@@ -2445,6 +2621,19 @@ async function main() {
       'a DingTalk retry is signed with the retry clock, not the first attempt',
       probe && probe.reusedSign === false,
       probe ? probe.detail : 'the probe did not boot',
+    )
+    fs.rmSync(scratch, { recursive: true, force: true })
+  }
+  {
+    /* The digest interval must take effect on the save, not on the next flush.
+       `armDigest` early-returns on an armed timer, so a config save while events
+       are held is inert unless the timer is explicitly re-armed. */
+    const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-notify-resched-'))
+    const probe = await probeDigestReschedule({ variantMod: mod, scratch, makeCtx })
+    check(
+      'changing the digest interval re-arms the pending flush',
+      probe && probe.booted === true && probe.rescheduled === true,
+      probe ? `${probe.dueCount} timer(s) fell due inside six minutes; ${probe.delivered} delivery/ies on the wire, digest among them: ${probe.flushed}; still held: ${probe.heldCount}` : 'the probe did not boot',
     )
     fs.rmSync(scratch, { recursive: true, force: true })
   }

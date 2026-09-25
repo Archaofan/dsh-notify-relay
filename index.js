@@ -1450,10 +1450,23 @@ async function flushDigest() {
   return { sent: items.length }
 }
 
+/**
+ * The digest tick, in milliseconds.
+ *
+ * `intervalMinutes` is clamped on the way in by `validateConfig`, so the floor
+ * here is belt-and-braces against a hand-edited storage file. It is a function
+ * rather than a constant because the interval is a live setting: every caller
+ * that captured the value once kept it forever, and a digest the user retimed
+ * from 30 minutes to 5 kept firing on the 30.
+ */
+function digestIntervalMs() {
+  return Math.max(1, config.digest.intervalMinutes) * 60_000
+}
+
 /** Arms the digest timer if it is not already running. */
 function armDigest() {
   if (digestTimer || digestQueue.length === 0 || !hostCtx) return
-  const delay = Math.max(1, config.digest.intervalMinutes) * 60_000
+  const delay = digestIntervalMs()
   digestTimer = hostCtx.timeout(() => {
     void flushDigest()
   }, delay)
@@ -1477,7 +1490,7 @@ function armOutboxTimer(delay) {
          that stops when the queue is empty cannot detect the one failure it
          exists to catch - a relay that is enabled and quietly delivering
          nothing. */
-      if (config.enabled) armOutboxTimer(delay)
+      if (config.enabled) armOutboxTimer(digestIntervalMs())
     })()
   }, delay)
 }
@@ -1488,6 +1501,33 @@ function disarmDigest() {
   if (outboxTimer) outboxTimer()
   outboxTimer = null
   digestQueue = []
+}
+
+/**
+ * Disposes the outbox timer only, leaving the digest timer and the held queue
+ * alone. `disarmDigest` drops the queue, which is right when batching is being
+ * switched off and wrong when the interval is merely being retimed.
+ */
+function disarmOutboxTimer() {
+  if (outboxTimer) outboxTimer()
+  outboxTimer = null
+}
+
+/**
+ * Re-arms the digest timer on the CURRENT interval, keeping the held queue.
+ *
+ * This is deliberately not `disarmDigest()` followed by `armDigest()`.
+ * `disarmDigest` also empties `digestQueue`, which is right when batching is
+ * switched off and catastrophic when it is merely being retimed: every held
+ * notification would be dropped on the way to rescheduling the very timer that
+ * exists to deliver them, and the user would see nothing at all. That is exactly
+ * what the first version of the retime fix did, and the reschedule probe caught
+ * it because the queue was empty by the time `armDigest` looked.
+ */
+function rearmDigest() {
+  if (digestTimer) digestTimer()
+  digestTimer = null
+  armDigest()
 }
 
 /* ------------------------------------------------------------------ *
@@ -1754,12 +1794,32 @@ function registerRoutes(webServer) {
             }
             config = checked.value
             await persistConfig()
-            if (config.digest.enabled && digestQueue.length > 0) armDigest()
+            /* Re-arm on the new interval, do not merely arm. `armDigest` and
+               `armOutboxTimer` both early-return when a timer is already running,
+               so calling them here on a relay that already holds events would
+               leave the pending flush on whatever interval was current when the
+               FIRST event arrived. The setting is stored correctly — it is the
+               timer that goes stale, and the user waits the original half hour
+               after asking for five minutes. Disposing first costs one discarded
+               timer and makes the save take effect immediately, which is what the
+               settings page already implies by accepting it.
+
+               `rearmDigest`, not `disarmDigest` + `armDigest`: the latter empties
+               the held queue and would drop every batched notification on the
+               save that was meant to reschedule their delivery. */
+            if (config.digest.enabled && digestQueue.length > 0) {
+              rearmDigest()
+              disarmOutboxTimer()
+              armOutboxTimer(digestIntervalMs())
+            }
             if (!config.digest.enabled) disarmDigest()
             /* Turning the relay on from the settings page must start the
                heartbeat too, or a freshly configured relay has no self-monitor
                until the next restart. */
-            if (config.enabled) armOutboxTimer(Math.max(1, config.digest.intervalMinutes) * 60_000)
+            if (config.enabled) {
+              disarmOutboxTimer()
+              armOutboxTimer(digestIntervalMs())
+            }
             sendJson(res, 200, { ok: true, config: redactConfig(config) })
             return
           }
@@ -1911,7 +1971,7 @@ export async function apply(ctx) {
      only when work is pending would mean a relay whose channels are all broken -
      and which therefore has nothing to retry - never checks itself. */
   if (outbox.length > 0) log.info(`${outbox.length} notification(s) awaiting retry after restart`)
-  if (config.enabled) armOutboxTimer(Math.max(1, config.digest.intervalMinutes) * 60_000)
+  if (config.enabled) armOutboxTimer(digestIntervalMs())
 
   ctx.effect(() => {
     let disposeCommands = () => {}

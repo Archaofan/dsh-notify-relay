@@ -328,6 +328,26 @@ out (10s) or refuses the connection is recorded as `failed` in the log and the
 other channels still get their message. Concurrency is capped at 3 so a
 misconfigured endpoint cannot flood the socket.
 
+### Changing the digest interval takes effect immediately
+
+`intervalMinutes` is read when the timer is armed, and the timer is re-armed on
+the save that changes it — so retiming 30 → 5 does what the settings page says it
+does. Before 0.4.3 it did not: `armDigest` early-returns when a timer is already
+running, so a save on a relay that already held events was inert and the pending
+digest still fired on the interval that was current when the *first* event
+arrived. The setting was stored correctly, which is what made it hard to see.
+
+The same applied to the outbox heartbeat, which shares the tick and is worse
+there: it re-armed with the delay captured when it was first armed, so the
+heartbeat stayed on the old interval **forever**, across every flush.
+
+One trap worth knowing if you extend this: `disarmDigest()` also empties the held
+queue. That is right when batching is being switched off and catastrophic when it
+is merely being retimed — every batched notification would be dropped on the save
+that was meant to reschedule their delivery. The retime path uses `rearmDigest()`,
+which disposes only the timer, and there is a broken-build variant that puts the
+naive version back to prove the gate still catches it.
+
 Backoff is exponential with **bounded jitter**: 30s, 1m, 2m, 4m … capped at 30
 minutes, then multiplied by a uniform draw in `[0.75, 1.25]`. Without jitter every
 pending item computes the *same* next-attempt time, so the moment a shared channel
@@ -351,7 +371,7 @@ all of which must pass, and three of which are designed to **fail**:
 
 | Gate | What it proves |
 | --- | --- |
-| `.sandbox/host-harness.cjs` | The fail-loud inject contract, the rule engine (dedup / quiet hours / severity mapping / payload builders / redaction), a **real HTTP delivery** to a loopback server, the deep link on the wire, the breaker state machine, the durable outbox (enqueue / backoff / retry / give-up / restart recovery), and **17 broken-build variants** |
+| `.sandbox/host-harness.cjs` | The fail-loud inject contract, the rule engine (dedup / quiet hours / severity mapping / payload builders / redaction), a **real HTTP delivery** to a loopback server, the deep link on the wire, the breaker state machine, the durable outbox (enqueue / backoff / retry / give-up / restart recovery), the digest interval retiming, and **18 broken-build variants** |
 | `.sandbox/client-harness.cjs` | Materialization against a strict fake ctx, the inject contract, the settings-section thunk label across a language switch, dictionary key parity, the editor round-trip, **event-vocabulary parity with the host**, **channel-vocabulary parity with the host**, and 5 broken variants |
 | `.sandbox/live-check.cjs` | The plugin **booted inside a real DSH**: config write → read-back → real socket delivery → log → reset → `/retry` → delivery language |
 | `.sandbox/e2e-notify.mjs` | The browser half in a **real GUI**: pill, delivery panel, official settings section, and a UI change that round-trips through the host |

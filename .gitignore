@@ -42,3 +42,6 @@ home/
 # `commit-msg-040.txt` and `commit-msg-test.txt` through, and an accidental
 # `git add -A` committed one of them.
 .sandbox/commit-msg*.txt
+# Captured gate output from a debugging session. It is a build artifact,
+# not a source, and it was committed once by accident.
+.sandbox/gate-out*.txt
