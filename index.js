@@ -27,7 +27,7 @@
  * @module dsh-notify-relay
  */
 
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 
@@ -184,6 +184,7 @@ export const CHANNEL_KINDS = [
   { id: 'telegram', secretFields: ['token', 'chatId'] },
   { id: 'wecom', secretFields: ['key'] },
   { id: 'feishu', secretFields: ['token'] },
+  { id: 'dingtalk', secretFields: ['token', 'secret'] },
   { id: 'ntfy', secretFields: [] },
   { id: 'webhook', secretFields: ['token'] },
 ]
@@ -653,6 +654,63 @@ function feishuPayload(n, secrets) {
   }
 }
 
+/**
+ * 钉钉自定义机器人.
+ *
+ * The only channel that needs a signature. DingTalk's 加签 mode rejects any
+ * request whose `timestamp` and `sign` do not agree, and both are derived from
+ * the delivery's own clock:
+ *
+ *   stringToSign = `${timestamp}\n${secret}`
+ *   sign         = base64(HmacSHA256(key = secret, data = stringToSign))
+ *
+ * which is why `buildDelivery` takes a `now`. Every other payload builder is
+ * pure -- no fetch, no clock, no I/O -- and reading the clock inside them would
+ * make the unit tests depend on when they ran rather than on what they build.
+ *
+ * The timestamp is taken at delivery time, never from the notification's
+ * `createdAt`: DingTalk rejects a sign older than an hour, and the outbox holds
+ * failed notifications precisely so they can be retried after a restart. A
+ * notification that sat queued for ninety minutes would be signed with a
+ * timestamp the server has already forgotten, and the retry would fail for a
+ * reason that has nothing to do with the network.
+ *
+ * A robot configured with a keyword or an IP allowlist instead of 加签 has no
+ * secret. That is a valid security choice, not a broken one, so it is sent
+ * unsigned rather than refused.
+ *
+ * Severity maps to DingTalk's native equivalent of Bark's `call` and ntfy's
+ * Priority 5: `at.isAtAll`. A critical failure is the one event worth waking a
+ * whole group for; everything else stays quiet in the channel.
+ */
+function dingtalkPayload(n, secrets, now) {
+  const token = String(secrets.token || '')
+  const secret = String(secrets.secret || '')
+  const init = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      msgtype: 'markdown',
+      markdown: { title: n.title, text: `### ${n.title}\n\n${n.body}` },
+      at: { isAtAll: n.severity === 'critical' },
+    }),
+  }
+  if (!secret) {
+    return {
+      url: `https://oapi.dingtalk.com/robot/send?access_token=${encodeURIComponent(token)}`,
+      init,
+    }
+  }
+  const timestamp = String(now || Date.now())
+  const sign = encodeURIComponent(
+    createHmac('sha256', secret).update(`${timestamp}\n${secret}`, 'utf8').digest('base64')
+  )
+  return {
+    url: `https://oapi.dingtalk.com/robot/send?access_token=${encodeURIComponent(token)}&timestamp=${timestamp}&sign=${sign}`,
+    init,
+  }
+}
+
 /** ntfy: plain text to a topic; the topic lives in the channel URL. */
 function ntfyPayload(n) {
   const link = linkFor(n)
@@ -701,6 +759,7 @@ const PAYLOAD_BUILDERS = {
   telegram: telegramPayload,
   wecom: wecomPayload,
   feishu: feishuPayload,
+  dingtalk: dingtalkPayload,
   ntfy: ntfyPayload,
   webhook: webhookPayload,
 }
@@ -713,14 +772,22 @@ const PAYLOAD_BUILDERS = {
  * URL) take it from `channel.url`; the fixed-endpoint kinds derive it from the
  * stored secret.
  *
+ * `now` is the delivery clock, in epoch milliseconds. It is a parameter rather
+ * than a read inside the builders so that the one channel which needs it
+ * (钉钉, whose 加签 signature covers a timestamp) can be tested against a fixed
+ * time, and so that a retry is signed with the time of the retry rather than
+ * the time of the original notification. Defaults to the current time, so the
+ * existing two-argument callers and unit tests are unaffected.
+ *
  * @param {object} channel
  * @param {{ title: string, body: string }} notification
+ * @param {number} [now]
  * @returns {{ url: string, init: object } | { error: string }}
  */
-export function buildDelivery(channel, notification) {
+export function buildDelivery(channel, notification, now = Date.now()) {
   const builder = PAYLOAD_BUILDERS[channel.kind]
   if (!builder) return { error: `unknown channel kind: ${channel.kind}` }
-  const built = builder(notification, channel.secrets || {})
+  const built = builder(notification, channel.secrets || {}, now)
   const url = channel.url || built.url
   if (!url) return { error: 'channel has no endpoint' }
   if (!/^https?:\/\//i.test(url)) return { error: 'channel endpoint must be http(s)' }
@@ -1003,7 +1070,7 @@ async function deliverTo(channel, notification, meta) {
     await recordDelivery(entry)
     return entry
   }
-  const built = buildDelivery(channel, notification)
+  const built = buildDelivery(channel, notification, started)
   if (built.error) {
     /* A malformed channel is a config bug, not a network blip: tripping the
        breaker on it would hide the error behind a cooldown. */

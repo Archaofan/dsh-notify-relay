@@ -2,7 +2,7 @@
 
 DSH 的外联**规则中枢**：任务完成、任务失败、任务中止、任务受阻、请求失败、待审批、
 审批已决、工具失败这几类生命周期事件，先过去重、免打扰、摘要合批三道关，再发到
-Bark、Server酱、Telegram、企业微信、飞书、ntfy 或任意 webhook。投递失败自动重试，
+Bark、Server酱、Telegram、企业微信、飞书、钉钉、ntfy 或任意 webhook。投递失败自动重试，
 重启不丢。
 
 零运行时依赖、无构建步骤，两个源文件（host 面 + 浏览器面）。中英双语，界面跟随
@@ -54,6 +54,7 @@ DSH 自己的语言设置；**推送到你手机上的文案语言单独可设**
 | `telegram` | bot token + chat id | `sendMessage`，任务完成时静音 |
 | `wecom` | webhook key | 企业微信机器人 markdown |
 | `feishu` | webhook token | 飞书交互卡片 |
+| `dingtalk` | access token + 加签密钥（可空） | 钉钉自定义机器人 markdown，`critical` 时 @所有人 |
 | `ntfy` | topic（可选服务地址） | ntfy JSON 发布 |
 | `webhook` | 任意 URL | 通用 JSON POST；可配一个自定义请求头携带密钥 |
 

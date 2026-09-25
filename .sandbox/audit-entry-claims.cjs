@@ -4,7 +4,7 @@
  * the plugin that a user can falsify in thirty seconds by installing it. The
  * registry's CI checks the YAML SHAPE -- allowed keys, parseable, README
  * regenerates -- and nothing about whether the description is true. So this
- * checks the claims, against the actual v0.3.3 tarball rather than the working
+ * checks the claims, against the actual v0.4.0 tarball rather than the working
  * tree, because the tarball is what the entry points at.
  */
 const { execFileSync } = require('node:child_process')
@@ -12,7 +12,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 
-const TARBALL = 'https://github.com/Archaofan/dsh-notify-relay/releases/download/v0.3.3/dsh-notify-relay-0.3.3.tgz'
+const TARBALL = 'https://github.com/Archaofan/dsh-notify-relay/releases/download/v0.4.0/dsh-notify-relay-0.4.0.tgz'
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'claim-audit-'))
 const tgz = path.join(tmp, 'r.tgz')
@@ -61,22 +61,26 @@ function countInBlock(source, header) {
   return [...new Set(ids)]
 }
 
-console.log('=== the marketplace entry\'s claims, against the shipped v0.3.3 ===\n')
+console.log("=== the marketplace entry's claims, against the shipped v0.4.0 ===\n")
 
 /* 1. "eight DSH lifecycle events" */
 const events = countInBlock(index, 'EVENT_KINDS') || []
 claim('eight lifecycle events', events.length === 8, `EVENT_KINDS has ${events.length}: ${events.join(', ')}`)
 
-/* 2. "seven channels" */
+/* 2. "eight channels" -- was seven until DingTalk. The count is a claim the
+   entry makes in prose ("into eight channels"), so it is audited like any
+   other: against the block the entry points at, not against a remembered
+   number. */
 const channels = countInBlock(index, 'CHANNEL_KINDS') || []
-claim('seven channels', channels.length === 7, `CHANNEL_KINDS has ${channels.length}: ${channels.join(', ')}`)
+claim('eight channels', channels.length === 8, `CHANNEL_KINDS has ${channels.length}: ${channels.join(', ')}`)
+claim('dingtalk is one of them', channels.includes('dingtalk'), channels.join(', '))
 
 /* 3. dedup, quiet hours, digest batching */
 claim('dedup', /dedup|duplicate/i.test(both))
 claim('quiet hours', /quiet|免打扰|dnd/i.test(both))
 claim('digest batching', /digest|batch/i.test(both))
 
-/* 4. severity maps to real fields for bark/ntfy/telegram/webhook.
+/* 4. severity maps to real fields for bark/ntfy/telegram/dingtalk/webhook.
  * Checking that the channel NAME appears would pass on a comment. The claim is
  * that severity reaches a field that channel actually supports, so look for the
  * field each one really takes. */
@@ -86,6 +90,7 @@ const sevFields = {
   bark: /call\s*:\s*'1'|volume\s*:\s*'10'/,
   ntfy: /priority\s*:\s*\{[^}]*critical[^}]*\}/,
   telegram: /disable_notification\s*:/,
+  dingtalk: /isAtAll\s*:/,
   webhook: /severity\s*:\s*n\.severity/,
 }
 for (const [ch, re] of Object.entries(sevFields)) {

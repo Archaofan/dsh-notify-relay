@@ -257,6 +257,33 @@ if (!section) {
     return node ? node.disabled === true : null
   })
   check(retryDisabled === true, 'the retry button is disabled with an empty outbox', String(retryDisabled))
+
+  /* Open the channel editor and count the kinds it offers.
+     The channel picker is the only place a new channel kind becomes visible to
+     a user, and it only exists once a draft channel is open. v0.4.0 added
+     DingTalk, so the real GUI must show it -- the client harness proves the
+     option renders in a fake DOM, but only a browser proves it reaches the
+     official settings section. */
+  const kindOptions = await page.evaluate(async () => {
+    const add = document.querySelector('[data-testid="relay-add-channel"]')
+    if (!add) return null
+    add.click()
+    await new Promise((r) => setTimeout(r, 400))
+    const select = document.querySelector('[data-testid="relay-channel-kind"]')
+    if (!select) return null
+    return [...select.querySelectorAll('option')].map((o) => o.value)
+  })
+  if (kindOptions === null) {
+    check(false, 'the channel editor opens to show the kind picker', 'no kind select after clicking add-channel')
+  } else {
+    check(kindOptions.length === 8, 'the kind picker offers every channel', `${kindOptions.length}: ${kindOptions.join(', ')}`)
+    check(kindOptions.includes('dingtalk'), 'DingTalk is offered in the real GUI', kindOptions.join(', '))
+    /* Undo the draft so the run leaves the config as it found it. */
+    await page.evaluate(() => {
+      const del = document.querySelector('[data-testid^="relay-channel-delete-"]')
+      if (del) del.click()
+    }).catch(() => {})
+  }
 }
 
 /* ------------------------------------------------------------------ *

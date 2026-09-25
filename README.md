@@ -3,8 +3,8 @@
 The outbound **rule center** for DSH: lifecycle events — task done, task failed,
 task aborted, task blocked, request failed, approval asked, approval decided,
 tool failed — go through dedup, quiet hours and digest batching, then out to
-Bark, ServerChan, Telegram, WeCom, Feishu, ntfy or any webhook. Failed deliveries
-retry with backoff and survive a restart.
+Bark, ServerChan, Telegram, WeCom, Feishu, DingTalk, ntfy or any webhook. Failed
+deliveries retry with backoff and survive a restart.
 
 Zero runtime dependencies, no build step, two source files (host face +
 browser face). Bilingual (zh / en) — the UI follows DSH's own language, and the
@@ -60,6 +60,7 @@ token you did not touch.
 | `telegram` | bot token + chat id | `sendMessage`, silent on task-done |
 | `wecom` | webhook key | WeCom robot markdown |
 | `feishu` | webhook token | Feishu interactive card |
+| `dingtalk` | access token + sign secret (optional) | DingTalk custom robot markdown; `critical` @-mentions everyone |
 | `ntfy` | topic (+ optional server) | ntfy JSON publish |
 | `webhook` | any URL | Generic JSON POST; an optional custom header carries the secret |
 

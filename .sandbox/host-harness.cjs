@@ -400,6 +400,87 @@ function testSeverity(mod) {
   check('webhook carries severity as data', hook.severity === 'critical', JSON.stringify(hook))
 }
 
+/* DingTalk is the only channel whose request is signed, so it is the only one
+   where a wrong formula fails EVERY delivery while looking fine locally -- the
+   payload is well-formed, the fetch succeeds, and DingTalk answers
+   `errcode: 310000` ("sign match fail") with an HTTP 200. Nothing in the e2e
+   catches that either, because a real robot token is not something a test can
+   hold. So the formula is pinned against the reference implementation published
+   in DingTalk's own tutorial, byte for byte.
+
+   The vector below was produced by the Python reference:
+     timestamp = '1700000000000'
+     secret    = 'SECabc123XYZ'
+     stringToSign = '1700000000000\nSECabc123XYZ'
+     sign = quote_plus(base64(hmac_sha256(secret, stringToSign)))
+   If index.js ever drifts from that, this fails before a user's first send. */
+function testDingtalkSign(mod) {
+  const { buildDelivery } = mod
+  const note = { kind: 'task.failed', title: 'Build broke', body: 'ECONNRESET', sessionId: 's1', severity: 'high', createdAt: 'x' }
+  const channel = { id: 'c', kind: 'dingtalk', secrets: { token: 'TK', secret: 'SECabc123XYZ' }, url: '' }
+
+  const built = buildDelivery(channel, note, 1700000000000)
+  const url = new URL(built.url)
+  const sign = url.searchParams.get('sign')
+  const timestamp = url.searchParams.get('timestamp')
+  const accessToken = url.searchParams.get('access_token')
+
+  /* `searchParams.get()` percent-DECODES what it returns, so it yields the
+     base64 the server will reconstruct, not the bytes on the wire. Both forms
+     matter and they are not the same assertion:
+       - decoded: what DingTalk compares against its own HMAC
+       - raw:     what actually travels in the URL
+     The first version of this check compared the decoded value against the
+     percent-encoded reference and failed on a correct implementation. */
+  check('dingtalk sends the access token', accessToken === 'TK', String(accessToken))
+  check('dingtalk signs with the delivery clock', timestamp === '1700000000000', String(timestamp))
+  check(
+    'dingtalk sign decodes to the reference base64',
+    sign === 'feitHoHj+s3gv0Nk0htsw51AzjgjsASaIU6bM39nhGE=',
+    String(sign),
+  )
+  check(
+    'dingtalk sign travels percent-encoded on the wire',
+    built.url.includes('sign=feitHoHj%2Bs3gv0Nk0htsw51AzjgjsASaIU6bM39nhGE%3D'),
+    built.url,
+  )
+
+  /* The retry hazard the `now` parameter exists for. A notification that sat in
+     the outbox must be signed with the time of the RETRY, not the time it was
+     created -- DingTalk rejects a sign older than an hour. */
+  const later = buildDelivery(channel, note, 1700003600000)
+  const laterUrl = new URL(later.url)
+  check('dingtalk re-signs at the delivery clock, not createdAt', laterUrl.searchParams.get('timestamp') === '1700003600000', laterUrl.searchParams.get('timestamp'))
+  check('a different clock yields a different sign', laterUrl.searchParams.get('sign') !== sign)
+
+  /* A robot on keyword or IP-allowlist security has no secret. That is a valid
+     configuration, not a broken one, so it must still send. */
+  const unsigned = buildDelivery({ ...channel, secrets: { token: 'TK' } }, note, 1700000000000)
+  const unsignedUrl = new URL(unsigned.url)
+  check('dingtalk without a secret still sends', unsignedUrl.searchParams.get('access_token') === 'TK')
+  check('dingtalk without a secret carries no sign', unsignedUrl.searchParams.get('sign') === null)
+  check('dingtalk without a secret carries no timestamp', unsignedUrl.searchParams.get('timestamp') === null)
+
+  /* Severity must map to a field the channel actually has. */
+  const body = JSON.parse(built.init.body)
+  check('dingtalk body is markdown', body.msgtype === 'markdown', body.msgtype)
+  check('dingtalk markdown carries the title', body.markdown && body.markdown.title === 'Build broke', JSON.stringify(body.markdown))
+  check('dingtalk markdown carries the body', body.markdown && body.markdown.text.includes('ECONNRESET'), JSON.stringify(body.markdown))
+  const criticalBody = JSON.parse(buildDelivery(channel, { ...note, severity: 'critical' }, note, 1700000000000).init.body)
+  check('dingtalk critical @-mentions everyone', criticalBody.at && criticalBody.at.isAtAll === true, JSON.stringify(criticalBody.at))
+  const normalBody = JSON.parse(buildDelivery(channel, { ...note, severity: 'normal' }, note, 1700000000000).init.body)
+  check('dingtalk normal does not @-mention', normalBody.at && normalBody.at.isAtAll === false, JSON.stringify(normalBody.at))
+
+  /* A token is user data: it must not be able to inject extra query parameters
+     into the URL it is embedded in. */
+  const injected = buildDelivery({ ...channel, secrets: { token: 'TK&isAtAll=true', secret: 'S' } }, note, 1700000000000)
+  check(
+    'a token cannot inject query parameters',
+    new URL(injected.url).searchParams.get('isAtAll') === null,
+    injected.url,
+  )
+}
+
 function testDeepLink(mod) {
   const { validateConfig } = mod
   const channel = { id: 'c1', kind: 'bark', secrets: { key: 'K' }, enabled: true, events: ['*'] }
@@ -2132,6 +2213,7 @@ async function main() {
   testQuietHours(mod)
   testBuildDelivery(mod)
   testSeverity(mod)
+  testDingtalkSign(mod)
   testDeepLink(mod)
   testBackoffJitter(mod)
   testBreaker(mod)

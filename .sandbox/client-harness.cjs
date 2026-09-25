@@ -445,6 +445,14 @@ const loader = {
    Comparing the two lists is the only check that catches it. */
 const hostModule = require('../index.js')
 const hostEventKinds = hostModule.EVENT_KINDS.map((kind) => kind.id)
+/* Same hazard, different list: the browser half keeps its own CHANNEL_KINDS so
+   it can render the picker and the per-kind secret fields. DingTalk was added
+   to both, but a hardcoded "7" in the option-count check would have caught only
+   the addition, not a future drift between the two halves. Read the host's list
+   and compare against what the client actually renders. */
+const hostChannelKinds = hostModule.CHANNEL_KINDS.map((kind) => kind.id)
+const EXPECTED_CHANNEL_KINDS = hostChannelKinds.length
+const CHANNEL_KIND_IDS = new Set(hostChannelKinds)
 
 /* The stub React forwards to whichever instance mount() is rendering. */
 global.window.__ModuleLoader__ = loader
@@ -719,7 +727,14 @@ async function main() {
 
   const kindSelect = byTestId(tree, 'relay-channel-kind')
   check('channel kind select rendered', kindSelect.length === 1)
-  check('channel kind select lists all 7 kinds', kindSelect[0] && flatten(kindSelect[0]).filter((node) => node.type === 'option').length === 7)
+  /* The count must equal CHANNEL_KINDS.length in BOTH halves. A hardcoded
+     number is how the last channel addition (DingTalk) broke this: the select
+     grew to 8 and the check still asked for 7. Read it from the module under
+     test instead, so a new channel cannot desynchronise the harness. */
+  const kindCount = kindSelect[0] ? flatten(kindSelect[0]).filter((node) => node.type === 'option').length : 0
+  check('channel kind select lists every declared kind', kindCount === EXPECTED_CHANNEL_KINDS, `${kindCount} options, expected ${EXPECTED_CHANNEL_KINDS}`)
+  const hostKinds = CHANNEL_KIND_IDS.size
+  check('the client lists exactly the kinds the host declares', kindCount === hostKinds, `client ${kindCount}, host ${hostKinds}`)
 
   const logRows = flatten(tree).filter((node) => node.props && node.props.className === 'dsh-relay-log-row')
   check('delivery log rows rendered', logRows.length === 3, `${logRows.length} found`)
