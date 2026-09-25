@@ -174,8 +174,17 @@ dsh plugin --profile web add file:./dsh-notify-relay-0.3.3.tgz --ignore-scripts
 | --- | --- |
 | `approval.asked` | **紧急（critical）** |
 | `task.failed`、`task.aborted`、`task.blocked`、`request.failed`、`tool.failed`、`relay.degraded` | 重要（high） |
-| `task.done`、`approval.decided`、摘要、测试 | 普通（normal） |
+| `task.done`、`approval.decided`、测试 | 普通（normal） |
 | （没有事件映射到 low；它存在是为了让通道能降级） | 低（low） |
+
+**摘要不在这张表里，因为它自己没有严重度。** 它继承它所含事件里最高的那一级：五个
+`task.failed` 攒成的一条摘要，就是五个 high，也按 high 发出去。开摘要是为了少收几条
+消息，不是为了少几分紧迫——而在 0.4.1 之前，摘要的严重度被硬编码成 `normal`，于是一条
+失败摘要到 Bark 是 `active` 而不是 `timeSensitive`，到 ntfy 是 Priority 3 而不是 4，
+日志里一个字都不提。
+
+上限是 high，永远不是 critical：`approval.asked` 是唯一的 critical，而它穿透摘要，从
+来不会被挂起。所以一条失败摘要该穿透静音，但不该 @ 整个钉钉群。
 
 严重度不是装饰，它落在各通道真实的 API 字段上，且已对着官方文档逐一核对：
 

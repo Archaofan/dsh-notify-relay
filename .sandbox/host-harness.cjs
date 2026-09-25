@@ -339,7 +339,7 @@ function testBuildDelivery(mod) {
  * ------------------------------------------------------------------ */
 
 function testSeverity(mod) {
-  const { SEVERITY_BY_KIND, severityOf, SEVERITIES } = mod
+  const { SEVERITY_BY_KIND, severityOf, SEVERITIES, digestSeverity } = mod
 
   check('severities are the four real ones', SEVERITIES.join(',') === 'critical,high,normal,low', SEVERITIES.join(','))
   check('an approval is critical', severityOf('approval.asked') === 'critical', severityOf('approval.asked'))
@@ -348,6 +348,31 @@ function testSeverity(mod) {
   check('a self-report is high, not critical', severityOf('relay.degraded') === 'high', severityOf('relay.degraded'))
   /* Total: an unknown kind must never crash the payload builders. */
   check('an unknown kind is normal', severityOf('who.knows') === 'normal', severityOf('who.knows'))
+
+  /* ---- the digest inherits severity, it does not reset it ----
+
+     `severity` was hardcoded to `'normal'` in flushDigest, so a batch of five
+     `high` failures arrived at Bark as `active` instead of `timeSensitive` and
+     at ntfy as Priority 3 instead of 4. Turning on digest batching is a request
+     for fewer messages, not for less urgency, and nothing in the log said the
+     downgrade happened. */
+  check('a digest of failures is high', digestSeverity([{ kind: 'task.failed' }]) === 'high', digestSeverity([{ kind: 'task.failed' }]))
+  check(
+    'a digest takes the most severe kind it holds',
+    digestSeverity([{ kind: 'task.done' }, { kind: 'task.failed' }, { kind: 'approval.decided' }]) === 'high',
+    digestSeverity([{ kind: 'task.done' }, { kind: 'task.failed' }, { kind: 'approval.decided' }]),
+  )
+  check('a digest of only routine events is normal', digestSeverity([{ kind: 'task.done' }]) === 'normal', digestSeverity([{ kind: 'task.done' }]))
+  check('an empty digest is normal', digestSeverity([]) === 'normal', digestSeverity([]))
+  check('a digest with no items argument is normal', digestSeverity(undefined) === 'normal', digestSeverity(undefined))
+  /* `critical` cannot appear in a digest, because `approval.asked` is the only
+     critical kind and it is marked `pierce` — it is never held. So the ceiling
+     is `high`: a batch of failures should break through, but must not @-mention
+     a whole DingTalk group. */
+  const heldKinds = mod.EVENT_KINDS.filter((k) => !k.pierce).map((k) => ({ kind: k.id }))
+  check('no held kind is critical', heldKinds.every((item) => severityOf(item.kind) !== 'critical'),
+    heldKinds.filter((item) => severityOf(item.kind) === 'critical').map((i) => i.kind).join(','))
+  check('a digest of every held kind tops out at high', digestSeverity(heldKinds) === 'high', digestSeverity(heldKinds))
 
   /* Every configured kind must have a severity, or the ladder has a hole. */
   const missing = mod.EVENT_KINDS.filter((k) => !SEVERITY_BY_KIND[k.id]).map((k) => k.id)
@@ -1046,6 +1071,16 @@ async function testApply(mod) {
         /* A digest has no single session. Sending a link that opens some other
            session than the one the notification is about is worse than no link. */
         check('a digest carries no link', payload.url === undefined, JSON.stringify(payload))
+        /* The behavioural half of the digest-severity fix. `digestSeverity` is
+           unit-tested above, but this asserts the real flush actually calls it:
+           `severity` was hardcoded to `'normal'`, so a digest of `high` failures
+           reached Bark as `active` instead of `timeSensitive`. Only the wire
+           shows which value shipped. */
+        check(
+          'a digest of failures is delivered as high, not normal',
+          payload.level === 'timeSensitive',
+          JSON.stringify(payload),
+        )
       }
 
       /* ---- the circuit breaker ----
@@ -1583,6 +1618,11 @@ async function outboxTest(mod, server, port, scratch, invocation, routes, readLo
 async function probeFeatures({ variantMod, scratch, makeCtx }) {
   const storageDir = path.join(scratch, 'storages', 'notify-relay')
   const outboxPath = path.join(storageDir, 'outbox.json')
+  /* Reported affirmatively so a probe that never reaches the flush cannot
+     green-light the variant: `digestDelivered` false means "we never saw it",
+     which is not evidence that the severity was right. */
+  let digestDelivered = false
+  let digestLevel = null
 
   /* The variant loop restores DSH_HOME in its own finally, which runs BEFORE
      this probe. Without re-pointing it here, every write the plugin makes lands
@@ -1700,6 +1740,26 @@ async function probeFeatures({ variantMod, scratch, makeCtx }) {
     await settle(250)
     const digestRegressed = !sent.some((entry) => entry.url.includes('api.day.app/TF'))
 
+    /* ---- the digest severity ----
+
+       The held event was `task.failed`, which is `high`. The digest must arrive
+       as `high` — Bark `timeSensitive`, ntfy Priority 4 — because batching is a
+       request for fewer messages, not for less urgency. `severity` was
+       hardcoded to `'normal'`, which delivered it as `active`.
+
+       Reported as (delivered, level) rather than a single boolean, so a probe
+       that never sees the digest cannot green-light the variant that breaks
+       this: "we never looked" is not evidence that the value was right. */
+    const digestWire = sent.find((entry) => entry.url.includes('api.day.app/TF'))
+    if (digestWire) {
+      digestDelivered = true
+      try {
+        digestLevel = JSON.parse(String(digestWire.init.body)).level
+      } catch {
+        digestLevel = null
+      }
+    }
+
     /* ---- the breaker ----
 
        Three distinct failures must open it, and a fourth notification must not
@@ -1789,6 +1849,8 @@ async function probeFeatures({ variantMod, scratch, makeCtx }) {
         jitterRemoved,
         heartbeatGated,
         monitorRemoved,
+        digestDelivered,
+        digestLevel,
         outbox: readOutbox().length,
       }
     } catch (error) {
@@ -2195,6 +2257,18 @@ async function testVariants(mod, originalSource) {
         ),
       probe: probeFeatures,
       expect: ({ probe }) => probe && probe.digestRegressed === true,
+    },
+    {
+      /* The digest severity regression this round fixed: `severity` hardcoded to
+         `'normal'`, so a batch of `high` failures arrives at Bark as `active`
+         instead of `timeSensitive` and at ntfy as Priority 3 instead of 4. The
+         user asked for fewer messages, not for less urgency, and nothing in the
+         log says the downgrade happened. */
+      label: 'the digest severity is hardcoded to normal',
+      mutate: (source) =>
+        source.replace(/severity: digestSeverity\(items\)/, "severity: 'normal'"),
+      probe: probeFeatures,
+      expect: ({ probe }) => probe && probe.digestDelivered === true && probe.digestLevel !== 'timeSensitive',
     },
     {
       /* A notifier that quietly stops notifying is strictly worse than no

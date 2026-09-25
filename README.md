@@ -192,8 +192,20 @@ unimportant one.
 | --- | --- |
 | `approval.asked` | **critical** |
 | `task.failed`, `task.aborted`, `task.blocked`, `request.failed`, `tool.failed`, `relay.degraded` | high |
-| `task.done`, `approval.decided`, digest, test | normal |
+| `task.done`, `approval.decided`, test | normal |
 | (nothing maps to low; it exists so a channel can downgrade) | low |
+
+A **digest is not in this table, because it has no severity of its own.** It
+inherits the most severe kind it holds: a digest of five `task.failed` events is
+five `high` events and arrives as `high`, not `normal`. Turning on batching is a
+request for fewer messages, not for less urgency — and until 0.4.1 the digest
+was hardcoded to `normal`, so a batch of failures reached Bark as `active`
+instead of `timeSensitive` and ntfy as Priority 3 instead of 4, with nothing in
+the log saying so.
+
+The ceiling is `high`, never `critical`: `approval.asked` is the only critical
+kind and it pierces batching, so it is never held. A digest of failures should
+break through, but must not @-mention a whole DingTalk group.
 
 Severity is not decoration — it lands on real API fields, verified against the
 vendor docs:

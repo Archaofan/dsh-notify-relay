@@ -177,6 +177,39 @@ export function severityOf(kind) {
   return SEVERITY_BY_KIND[kind] || 'normal'
 }
 
+/**
+ * The severity a digest should carry: the most severe of the kinds it holds.
+ *
+ * A digest is a container, and its severity was hardcoded to `normal`. That is a
+ * silent downgrade with teeth: a batch of five `task.failed` events — each `high`
+ * on its own — arrived at Bark as `active` instead of `timeSensitive`, and at
+ * ntfy as Priority 3 instead of 4. The user who turns on digest batching is
+ * asking for fewer messages, not for less urgency, and nothing in the log says
+ * the downgrade happened.
+ *
+ * `critical` can never appear here, because `approval.asked` is the only
+ * critical kind and it is marked `pierce` — it is never held. So the ceiling is
+ * `high`, which is correct: a batch of failures should break through, but should
+ * not @-mention a whole DingTalk group.
+ *
+ * The floor is `normal`, not `low`: an empty batch is "nothing to report", and
+ * `low` would make Bark answer `passive` — the quietest primitive there is —
+ * for a value that should never have been computed in the first place.
+ * `flushDigest` returns early on an empty queue, so this is defensive, but an
+ * exported helper that can answer `low` is a trap for the next caller.
+ *
+ * @param {Array<{ kind: string }>} items
+ * @returns {string}
+ */
+export function digestSeverity(items) {
+  let worst = 'normal'
+  for (const item of items || []) {
+    const severity = severityOf(item.kind)
+    if (SEVERITIES.indexOf(severity) < SEVERITIES.indexOf(worst)) worst = severity
+  }
+  return worst
+}
+
 /** Channel kinds 0.1.0 can deliver to. Every one is an HTTP call to a URL. */
 export const CHANNEL_KINDS = [
   { id: 'bark', secretFields: ['key'] },
@@ -1376,6 +1409,11 @@ async function reportDegraded(options = {}) {
  * README's own worked example - was filtered out of every digest and silently
  * received nothing at all. A digest is a container for the kinds it holds, so it
  * inherits their audience.
+ *
+ * It inherits their SEVERITY for the same reason, and that took until 0.4.1 to
+ * notice: `severity` was hardcoded to `'normal'`, so a digest of five `high`
+ * failures reached Bark as `active` rather than `timeSensitive`. See
+ * `digestSeverity`.
  */
 async function flushDigest() {
   digestTimer = null
@@ -1391,7 +1429,10 @@ async function flushDigest() {
   const notification = {
     kind: 'digest',
     sessionId: '*',
-    severity: 'normal',
+    /* Inherited, not hardcoded. Five held `task.failed` events are five `high`
+       events, and the digest must arrive as `high` — batching is a request for
+       fewer messages, not for less urgency. */
+    severity: digestSeverity(items),
     title: t().digestTitle(items.length),
     body: items.map((item) => `\u2022 ${item.title}${item.body ? ` \u2014 ${item.body}` : ''}`).join('\n'),
     createdAt: new Date().toISOString(),
