@@ -97,6 +97,69 @@ if ($text -match $marketing) { throw "description carries marketing language: $(
 Write-Host '  ok   no marketing language in the description'
 
 # ------------------------------------------------------------------------- *
+# 1b. this script's own claims must match the code too
+# ------------------------------------------------------------------------- *
+# The PR body below names a channel count and an event count. Those are claims
+# about the plugin, made in the same breath as the entry's own description, and
+# the entry's copy is audited against the tarball while this one was not: it
+# still said "seven channels" two releases after DingTalk made it eight. A
+# number nobody derives is a number nobody corrects, so derive both here and
+# let a drift throw before the PR opens rather than after a maintainer reads it.
+Step 'the PR body numbers'
+# Forward slashes, not $RepoRoot's backslashes: PowerShell interpolates the path
+# into the double-quoted -e argument and JS then reads \D and \i as escapes, so
+# the backslash form resolves to E:DSH-WorkspaceDSH-Notifyindex.js.
+$hostKinds = (& node -e "process.stdout.write(String(require('$(($RepoRoot -replace '\\','/'))/index.js').CHANNEL_KINDS.length))" 2>$null)
+$hostEvents = (& node -e "process.stdout.write(String(require('$(($RepoRoot -replace '\\','/'))/index.js').EVENT_KINDS.length))" 2>$null)
+if (-not $hostKinds -or -not $hostEvents) { throw 'could not read CHANNEL_KINDS/EVENT_KINDS from index.js' }
+
+# The words are spelled out so a wrong digit cannot pass by accident.
+$channelWord = @{ 7 = 'seven'; 8 = 'eight'; 9 = 'nine'; 10 = 'ten' }[[int]$hostKinds]
+$eventWord = @{ 7 = 'Seven'; 8 = 'Eight'; 9 = 'Nine'; 10 = 'Ten' }[[int]$hostEvents]
+if (-not $channelWord -or -not $eventWord) { throw "no English word for $hostKinds channels / $hostEvents events" }
+
+$bodyText = @'
+
+Adds one entry: data/plugins/Archaofan__dsh-notify-relay.yml
+
+An outbound notification rule center for DSH. __EVENTS__ lifecycle events go
+through dedup, quiet hours and digest batching, then out to __CHANNELS__ channels.
+Severity maps to the fields Bark, ntfy, Telegram and webhooks actually
+support; a digest inherits the most severe event it holds; failed deliveries
+retry with jittered backoff and survive a restart; per-channel circuit
+breakers stop hammering a dead endpoint; and a self-check reports a degraded
+relay instead of going silent.
+
+Zero runtime dependencies, no build step, two source files, bilingual.
+
+Verified locally before opening this: dsh.bundle declared, repo past the
+1-day floor and not archived, dsh-plugin topic set, the entry parses as YAML,
+the release asset answers 206 to a ranged GET, and the three screenshots
+declared in the repository's own screenshots.json resolve at HEAD.
+'@
+
+# The body is assembled once, here, and re-used at the bottom -- so the check
+# below and the PR that opens can never disagree about what was verified.
+$script:PrBody = $bodyText.Replace('__EVENTS__', $eventWord).Replace('__CHANNELS__', $channelWord)
+
+# A round trip, not a restatement. The obvious check -- "does the body contain the
+# word I just substituted" -- can never fail, because the body was built from that
+# same word. That is the third tautological assertion in this project's harnesses
+# and it reads exactly like a real one. So read the count back OUT of the finished
+# body, map it to a number, and compare against index.js: the body is now the
+# evidence rather than the thing being agreed with.
+foreach ($pair in @(@('__EVENTS__', $eventWord, 'lifecycle events'), @('__CHANNELS__', $channelWord, 'channels'))) {
+  if ($script:PrBody.Contains($pair[0])) { throw "placeholder $($pair[0]) was never substituted" }
+}
+$inverse = @{ 'seven' = 7; 'eight' = 8; 'nine' = 9; 'ten' = 10 }
+
+$bodyEventCount = if ($script:PrBody -match '(\w+) lifecycle events') { $inverse[$Matches[1]] } else { $null }
+if ($bodyEventCount -ne [int]$hostEvents) { throw "PR body names $bodyEventCount events; index.js declares $hostEvents" }
+$bodyChannelCount = if ($script:PrBody -match 'out to (\w+) channels') { $inverse[$Matches[1]] } else { $null }
+if ($bodyChannelCount -ne [int]$hostKinds) { throw "PR body names $bodyChannelCount channels; index.js declares $hostKinds" }
+Write-Host ("  ok   PR body names {0} events and {1} channels, read back out of the body and matched to index.js" -f $bodyEventCount, $bodyChannelCount)
+
+# ------------------------------------------------------------------------- *
 # 2. the repo must clear every bar the gate checks
 # ------------------------------------------------------------------------- *
 Step 'the repository'
@@ -315,24 +378,7 @@ try {
   Write-Host '  ok   branch pushed'
 
   Step 'the pull request'
-  $body = @'
-Adds one entry: data/plugins/Archaofan__dsh-notify-relay.yml
-
-An outbound notification rule center for DSH. Eight lifecycle events go
-through dedup, quiet hours and digest batching, then out to seven channels.
-Severity maps to the fields Bark, ntfy, Telegram and webhooks actually
-support; failed deliveries retry with jittered backoff and survive a restart;
-per-channel circuit breakers stop hammering a dead endpoint; and a self-check
-reports a degraded relay instead of going silent.
-
-Zero runtime dependencies, no build step, two source files, bilingual.
-
-Verified locally before opening this: dsh.bundle declared, repo past the
-1-day floor and not archived, dsh-plugin topic set, the entry parses as YAML,
-the release asset answers 206 to a ranged GET, and the three screenshots
-declared in the repository's own screenshots.json resolve at HEAD.
-'@
-  & gh pr create --repo $Upstream --base main --head "$login`:$Branch" --title 'Add dsh-notify-relay' --body $body
+  & gh pr create --repo $Upstream --base main --head "$login`:$Branch" --title 'Add dsh-notify-relay' --body $script:PrBody
 } finally {
   Pop-Location
 }
